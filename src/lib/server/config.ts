@@ -1,4 +1,5 @@
 import { env } from '$env/dynamic/private';
+import { validateRequired, parsePort } from '../../../env-schema.js';
 
 export interface Config {
 	port: number;
@@ -53,8 +54,11 @@ function oneOf<T extends string>(name: string, allowed: readonly T[], fallback: 
 }
 
 function loadConfig(): Config {
+	// Validate shared required-field schema (same check boot-env.js runs at startup)
+	validateRequired((name) => env[name]);
+
 	return {
-		port: intOr('PORT', 3000),
+		port: parsePort(env['PORT']),
 		host: required('BIND_HOST'),
 		projectsDir: required('PROJECTS_DIR'),
 		vibezzzRepo: required('VIBEZZZ_REPO'),

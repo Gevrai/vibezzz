@@ -1,25 +1,18 @@
 /**
- * Shared boot-time env validation.
+ * Boot-time env validation.
  * Used by vite.config.ts (dev) and start.js (prod) to enforce the
- * same env contract declared in src/lib/server/config.ts.
+ * same env contract used by the SvelteKit runtime config.
  *
- * Cannot import the SvelteKit config module directly because it
- * depends on $env/dynamic/private which is only available at runtime.
+ * Required fields and parsing rules come from env-schema.js so
+ * boot-time and runtime validation stay in sync.
  */
-
-/** @param {string} name */
-export function requireEnv(name) {
-	const value = process.env[name];
-	if (!value) {
-		throw new Error(`Missing required environment variable: ${name}`);
-	}
-	return value;
-}
+import { validateRequired, parsePort } from './env-schema.js';
 
 /** @returns {{ host: string, port: number }} */
 export function loadBootConfig() {
+	validateRequired((name) => process.env[name]);
 	return {
-		host: requireEnv('BIND_HOST'),
-		port: parseInt(process.env.PORT || '3000', 10)
+		host: /** @type {string} */ (process.env.BIND_HOST),
+		port: parsePort(process.env.PORT)
 	};
 }
