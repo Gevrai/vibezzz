@@ -5,7 +5,7 @@ import { defineConfig } from 'vite';
 export default defineConfig({
 	plugins: [tailwindcss(), sveltekit()],
 	server: {
-		host: process.env.HOST || '0.0.0.0',
+		host: process.env.BIND_HOST || '0.0.0.0',
 		port: parseInt(process.env.PORT || '3000', 10)
 	}
 });

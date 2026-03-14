@@ -55,7 +55,7 @@ function oneOf<T extends string>(name: string, allowed: readonly T[], fallback: 
 function loadConfig(): Config {
 	return {
 		port: intOr('PORT', 3000),
-		host: optional('HOST', '0.0.0.0'),
+		host: optional('BIND_HOST', '0.0.0.0'),
 		projectsDir: required('PROJECTS_DIR'),
 		vibezzzRepo: required('VIBEZZZ_REPO'),
 		defaultProvider: oneOf('DEFAULT_PROVIDER', ['claude', 'copilot'] as const, 'claude'),
