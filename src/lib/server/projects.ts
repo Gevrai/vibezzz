@@ -83,9 +83,9 @@ async function isDirectory(path: string): Promise<boolean> {
 }
 
 const DEFAULT_SIGNALS: ProjectSignals = {
-	preview_status: null,
+	preview_status: 'stopped',
 	preview_url: null,
-	publish_state: null,
+	publish_state: 'down',
 	publish_url: null,
 	agent_active: false,
 	last_agent_status: null
@@ -102,11 +102,11 @@ async function readSignals(projectAbsPath: string): Promise<ProjectSignals> {
 	);
 	if (deploy) {
 		if (deploy.preview) {
-			signals.preview_status = deploy.preview.status ?? null;
+			signals.preview_status = deploy.preview.status ?? 'stopped';
 			signals.preview_url = deploy.preview.url ?? null;
 		}
 		if (deploy.publish) {
-			signals.publish_state = deploy.publish.state ?? null;
+			signals.publish_state = deploy.publish.state ?? 'down';
 			signals.publish_url = deploy.publish.url ?? null;
 		}
 	}
@@ -272,8 +272,8 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 	// Create starter deploy.yaml
 	const deploy = {
 		preview: {
-			command: null,
-			port: null,
+			command: '',
+			port: 3001,
 			healthcheck_path: '/',
 			pid: null,
 			process_started_at: null,

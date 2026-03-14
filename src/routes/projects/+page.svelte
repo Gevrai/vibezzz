@@ -19,6 +19,7 @@
 		ready: 'bg-cyan-500/20 text-cyan-400',
 		starting: 'bg-yellow-500/20 text-yellow-400',
 		stopped: 'bg-gray-500/20 text-gray-400',
+		failed: 'bg-red-500/20 text-red-400',
 		error: 'bg-red-500/20 text-red-400'
 	};
 
@@ -89,18 +90,16 @@
 											{project.meta.project_stage.replace('_', ' ')}
 										</span>
 										{#if project.signals.agent_active}
-											<span class="rounded-full bg-purple-500/20 px-2 py-0.5 text-xs font-medium text-purple-400">🤖</span>
-										{/if}
-										{#if project.signals.preview_status}
-											<span class="rounded-full px-2 py-0.5 text-xs font-medium {previewColors[project.signals.preview_status] || 'bg-gray-500/20 text-gray-400'}">
-												preview {project.signals.preview_status}
-											</span>
-										{/if}
-										{#if project.signals.publish_state}
-											<span class="rounded-full px-2 py-0.5 text-xs font-medium {publishColors[project.signals.publish_state] || 'bg-gray-500/20 text-gray-400'}">
-												publish {project.signals.publish_state}
-											</span>
-										{/if}
+										<span class="rounded-full bg-purple-500/20 px-2 py-0.5 text-xs font-medium text-purple-400">🤖</span>
+									{:else}
+										<span class="rounded-full bg-gray-500/20 px-2 py-0.5 text-xs font-medium text-gray-400">🤖</span>
+									{/if}
+									<span class="rounded-full px-2 py-0.5 text-xs font-medium {previewColors[project.signals.preview_status ?? 'stopped'] || 'bg-gray-500/20 text-gray-400'}">
+										preview {project.signals.preview_status ?? 'stopped'}
+									</span>
+									<span class="rounded-full px-2 py-0.5 text-xs font-medium {publishColors[project.signals.publish_state ?? 'down'] || 'bg-gray-500/20 text-gray-400'}">
+										publish {project.signals.publish_state ?? 'down'}
+									</span>
 									</div>
 								</div>
 								<div class="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-gray-500">

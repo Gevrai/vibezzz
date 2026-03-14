@@ -13,6 +13,7 @@
 		ready: 'bg-cyan-500/20 text-cyan-400',
 		starting: 'bg-yellow-500/20 text-yellow-400',
 		stopped: 'bg-gray-500/20 text-gray-400',
+		failed: 'bg-red-500/20 text-red-400',
 		error: 'bg-red-500/20 text-red-400'
 	};
 
@@ -45,19 +46,17 @@
 				<span class="rounded-full bg-purple-500/20 px-2.5 py-1 text-xs font-medium text-purple-400">🤖 agent running</span>
 			{:else if data.signals.last_agent_status}
 				<span class="rounded-full bg-gray-500/20 px-2.5 py-1 text-xs font-medium text-gray-400">agent {data.signals.last_agent_status}</span>
+			{:else}
+				<span class="rounded-full bg-gray-500/20 px-2.5 py-1 text-xs font-medium text-gray-400">agent idle</span>
 			{/if}
 
-			{#if data.signals.preview_status}
-				<span class="rounded-full px-2.5 py-1 text-xs font-medium {previewColors[data.signals.preview_status] || 'bg-gray-500/20 text-gray-400'}">
-					preview {data.signals.preview_status}
-				</span>
-			{/if}
+			<span class="rounded-full px-2.5 py-1 text-xs font-medium {previewColors[data.signals.preview_status ?? 'stopped'] || 'bg-gray-500/20 text-gray-400'}">
+				preview {data.signals.preview_status ?? 'stopped'}
+			</span>
 
-			{#if data.signals.publish_state}
-				<span class="rounded-full px-2.5 py-1 text-xs font-medium {publishColors[data.signals.publish_state] || 'bg-gray-500/20 text-gray-400'}">
-					publish {data.signals.publish_state}
-				</span>
-			{/if}
+			<span class="rounded-full px-2.5 py-1 text-xs font-medium {publishColors[data.signals.publish_state ?? 'down'] || 'bg-gray-500/20 text-gray-400'}">
+				publish {data.signals.publish_state ?? 'down'}
+			</span>
 		</div>
 
 		<!-- URLs -->
