@@ -55,7 +55,7 @@ describe('config', () => {
 		const config = getConfig();
 
 		expect(config.port).toBe(3000);
-		expect(config.bindHost).toBe('0.0.0.0');
+		expect(config.host).toBe('0.0.0.0');
 		expect(config.defaultProvider).toBe('claude');
 		expect(config.caddyAdminUrl).toBe('http://localhost:2019');
 		expect(config.containerRuntime).toBe('docker');
@@ -97,6 +97,64 @@ describe('config', () => {
 
 		const { getConfig } = await import('../config.js');
 		expect(() => getConfig()).toThrow('Environment variable PORT must be an integer');
+	});
+
+	it('throws for invalid DEFAULT_PROVIDER', async () => {
+		setEnv({ DEFAULT_PROVIDER: 'openai' });
+
+		vi.doMock('$env/dynamic/private', () => ({
+			env: process.env
+		}));
+
+		const { getConfig } = await import('../config.js');
+		expect(() => getConfig()).toThrow(
+			'Environment variable DEFAULT_PROVIDER must be one of [claude, copilot], got: openai'
+		);
+	});
+
+	it('throws for invalid CONTAINER_RUNTIME', async () => {
+		setEnv({ CONTAINER_RUNTIME: 'lxc' });
+
+		vi.doMock('$env/dynamic/private', () => ({
+			env: process.env
+		}));
+
+		const { getConfig } = await import('../config.js');
+		expect(() => getConfig()).toThrow(
+			'Environment variable CONTAINER_RUNTIME must be one of [docker, podman], got: lxc'
+		);
+	});
+
+	it('throws for invalid EXPOSE_MODE', async () => {
+		setEnv({ EXPOSE_MODE: 'proxy' });
+
+		vi.doMock('$env/dynamic/private', () => ({
+			env: process.env
+		}));
+
+		const { getConfig } = await import('../config.js');
+		expect(() => getConfig()).toThrow(
+			'Environment variable EXPOSE_MODE must be one of [tunnel, direct], got: proxy'
+		);
+	});
+
+	it('accepts valid enum values', async () => {
+		setEnv({
+			DEFAULT_PROVIDER: 'copilot',
+			CONTAINER_RUNTIME: 'podman',
+			EXPOSE_MODE: 'direct'
+		});
+
+		vi.doMock('$env/dynamic/private', () => ({
+			env: process.env
+		}));
+
+		const { getConfig } = await import('../config.js');
+		const config = getConfig();
+
+		expect(config.defaultProvider).toBe('copilot');
+		expect(config.containerRuntime).toBe('podman');
+		expect(config.exposeMode).toBe('direct');
 	});
 
 	it('reads webhook config when set', async () => {

@@ -2,7 +2,7 @@ import { env } from '$env/dynamic/private';
 
 export interface Config {
 	port: number;
-	bindHost: string;
+	host: string;
 	projectsDir: string;
 	vibezzzRepo: string;
 	defaultProvider: 'claude' | 'copilot';
@@ -41,17 +41,28 @@ function intOr(name: string, fallback: number): number {
 	return parsed;
 }
 
+function oneOf<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+	const raw = env[name];
+	if (!raw) return fallback;
+	if (!(allowed as readonly string[]).includes(raw)) {
+		throw new Error(
+			`Environment variable ${name} must be one of [${allowed.join(', ')}], got: ${raw}`
+		);
+	}
+	return raw as T;
+}
+
 function loadConfig(): Config {
 	return {
 		port: intOr('PORT', 3000),
-		bindHost: optional('BIND_HOST', '0.0.0.0'),
+		host: optional('HOST', '0.0.0.0'),
 		projectsDir: required('PROJECTS_DIR'),
 		vibezzzRepo: required('VIBEZZZ_REPO'),
-		defaultProvider: optional('DEFAULT_PROVIDER', 'claude') as Config['defaultProvider'],
+		defaultProvider: oneOf('DEFAULT_PROVIDER', ['claude', 'copilot'] as const, 'claude'),
 		domain: required('DOMAIN'),
 		caddyAdminUrl: optional('CADDY_ADMIN_URL', 'http://localhost:2019'),
-		containerRuntime: optional('CONTAINER_RUNTIME', 'docker') as Config['containerRuntime'],
-		exposeMode: optional('EXPOSE_MODE', 'tunnel') as Config['exposeMode'],
+		containerRuntime: oneOf('CONTAINER_RUNTIME', ['docker', 'podman'] as const, 'docker'),
+		exposeMode: oneOf('EXPOSE_MODE', ['tunnel', 'direct'] as const, 'tunnel'),
 		lazyIdleTimeout: intOr('LAZY_IDLE_TIMEOUT', 300),
 		notifyWebhookUrl: optionalNullable('NOTIFY_WEBHOOK_URL'),
 		notifyWebhookBearerToken: optionalNullable('NOTIFY_WEBHOOK_BEARER_TOKEN')
