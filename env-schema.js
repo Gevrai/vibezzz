@@ -33,8 +33,12 @@ export function validateRequired(get) {
  */
 export function parsePort(raw, fallback = 3000) {
 	if (raw == null || raw === '') return fallback;
+	// Only allow bare decimal digits so Number() and parseInt() always agree.
+	if (!/^\d+$/.test(raw)) {
+		throw new Error(`PORT must be a valid integer (1–65535), got: ${raw}`);
+	}
 	const parsed = Number(raw);
-	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+	if (parsed < 1 || parsed > 65535) {
 		throw new Error(`PORT must be a valid integer (1–65535), got: ${raw}`);
 	}
 	return parsed;
