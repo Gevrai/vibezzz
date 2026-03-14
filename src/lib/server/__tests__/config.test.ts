@@ -8,7 +8,8 @@ describe('config', () => {
 		const defaults: Record<string, string> = {
 			PROJECTS_DIR: '/home/test/projects',
 			VIBEZZZ_REPO: '/home/test/projects/vibezzz',
-			DOMAIN: 'test.example.com'
+			DOMAIN: 'test.example.com',
+			BIND_HOST: '100.64.0.1'
 		};
 		Object.assign(process.env, defaults, overrides);
 	}
@@ -55,7 +56,7 @@ describe('config', () => {
 		const config = getConfig();
 
 		expect(config.port).toBe(3000);
-		expect(config.host).toBe('0.0.0.0');
+		expect(config.host).toBe('100.64.0.1');
 		expect(config.defaultProvider).toBe('claude');
 		expect(config.caddyAdminUrl).toBe('http://localhost:2019');
 		expect(config.containerRuntime).toBe('docker');
@@ -71,7 +72,7 @@ describe('config', () => {
 		}));
 
 		const { getConfig } = await import('../config.js');
-		expect(() => getConfig()).toThrow('Missing required environment variable: PROJECTS_DIR');
+		expect(() => getConfig()).toThrow('Missing required environment variable: BIND_HOST');
 	});
 
 	it('parses integer values', async () => {

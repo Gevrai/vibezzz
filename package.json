@@ -12,6 +12,7 @@
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test": "vitest run",
 		"test:watch": "vitest",
+		"start": "bun ./start.js",
 		"lint": "svelte-check --tsconfig ./tsconfig.json"
 	},
 	"devDependencies": {
