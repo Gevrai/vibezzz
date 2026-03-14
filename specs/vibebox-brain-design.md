@@ -91,15 +91,29 @@ idea_id: 1             # id from global ideas.yaml; null for external projects
 
 Active agent processes are also tracked in-memory by the Bun server (keyed by PID) for real-time status. On process exit the server writes the result back to `agents.yaml`.
 
+**Startup reconciliation:** On vibebox startup, the server scans all `.vibezzz/agents.yaml` files for entries with `status: running`, checks whether the stored PID is still alive (`process.kill(pid, 0)`), and updates any stale entries to `status: failed`.
+
 ### .vibezzz/deploy.yaml schema
 
 ```yaml
-port: 3001
-subdomain: my-app        # defaults to project name; used as <subdomain>.<DOMAIN>
-live: false              # whether currently routed publicly via Caddy
-start_command: "bun run dev"
-process_pid: null        # PID of running dev server; null when stopped
+# Dev server (local testing, not containerized)
+dev_port: 3001
+dev_start_command: "bun run dev"
+dev_pid: null              # PID of running dev server; null when stopped
+
+# Published container deployment
+subdomain: my-app          # defaults to project name; <subdomain>.<DOMAIN>
+state: lazy                # up | down | lazy
+image: null                # Docker/Podman image name:tag
+container_name: null       # derived from subdomain (e.g. "vibebox-my-app")
+container_id: null         # running container ID; null when stopped
+container_port: 3001       # port the container exposes
+idle_timeout: 300          # seconds of inactivity before lazy container sleeps
+last_request_at: null      # ISO timestamp; used for idle detection
+caddy_route_id: null       # Caddy route array index, stored for targeted DELETE
 ```
+
+**Startup reconciliation:** On vibebox startup, scan all `deploy.yaml` files. For any project with a non-null `container_id`, verify the container is actually running (`docker inspect`). If not, set `container_id: null`. For dev servers, clear stale `dev_pid` values similarly.
 
 ---
 
@@ -153,7 +167,7 @@ Ideas:
 
 - Collapsible category sections derived from `meta.yaml`
 - "Resync" button — rescans `PROJECTS_DIR`
-- Each project card: name, origin badge (brain/external), idea count, agent status dot (green if any agent running), LIVE badge if `deploy.yaml` live=true
+- Each project card: name, origin badge (brain/external), idea count, agent status dot (green if any agent running), deploy state badge (`UP` / `LAZY` / `DOWN`) if `deploy.yaml` exists
 - Move button per project: select/type new category
 - Click → `/projects/[...path]`
 
@@ -173,13 +187,22 @@ Three tabs:
 - "Start Agent" button: provider selector + freeform prompt input → spawns CLI process
 
 **Deploy tab**
-- Port input + start command input → saved to `deploy.yaml`
-- Start/Stop dev server button → spawns/kills the `start_command` process
+
+*Dev server section:*
+- Port + start command inputs → saved to `deploy.yaml`
+- Start/Stop dev server button → spawns/kills process locally (no container)
+- Accessible on Tailscale only (not public)
+
+*Published deployment section:*
+- Docker/Podman image input (e.g. `my-app:latest`)
 - Subdomain input (defaults to project name)
-- "Go Live" toggle:
-  - On: POST to Caddy admin API → adds `<subdomain>.<DOMAIN> → localhost:<port>` route → sets `live: true`
-  - Off: DELETE from Caddy admin API → sets `live: false`
-- Live URL shown when active: `https://<subdomain>.<DOMAIN>`
+- Idle timeout input (default 300s)
+- State selector: **up / down / lazy** (lazy is default)
+  - `up` — container always running, always routed
+  - `down` — container stopped, subdomain not routed
+  - `lazy` — container sleeps until a request arrives, wakes up, sleeps again after idle timeout
+- "Publish" / "Unpublish" button applies the selected state
+- Live URL: `https://<subdomain>.<DOMAIN>` shown when state is `up` or `lazy`
 
 ### `/monitor` — Global Agent Monitor
 
@@ -230,24 +253,34 @@ Three tabs:
 4. On process exit: server updates `agents.yaml` entry with `status: done|failed`, `finished_at`
 5. UI polls `/api/projects/[path]/agents` for live status
 
-### Go Live (Caddy routing)
+### Publish Project (container deployment)
 
-1. User sets port + subdomain in Deploy tab, toggles "Go Live"
-2. Server PUTs a route to Caddy admin API (`$CADDY_ADMIN_URL/config/apps/http/servers/srv0/routes`):
-   ```json
-   {
-     "match": [{ "host": ["<subdomain>.<DOMAIN>"] }],
-     "handle": [{ "handler": "reverse_proxy", "upstreams": [{ "dial": "localhost:<port>" }] }]
-   }
-   ```
-3. Server updates `deploy.yaml`: `live: true`
-4. UI shows live URL badge
+**State: `up`**
+1. Server runs `docker run -d --name <container_name> -p <container_port> <image>`
+2. Stores `container_id` in `deploy.yaml`
+3. Adds Caddy route: `<subdomain>.<DOMAIN>` → `localhost:<container_port>`; stores `caddy_route_id`
+4. Sets `state: up`
 
-### Take Down (Caddy routing)
+**State: `lazy`**
+1. Server adds Caddy route pointing to vibebox's own wake proxy: `<subdomain>.<DOMAIN>` → `localhost:<PORT>/wake/<subdomain>`; stores `caddy_route_id`
+2. Sets `state: lazy`, container not yet started
+3. On first incoming request to `/wake/<subdomain>`:
+   - Server starts container (`docker run ...`), waits for readiness
+   - Proxies the original request to `localhost:<container_port>`
+   - Updates `last_request_at`, `container_id`
+4. Subsequent requests to `/wake/<subdomain>` are proxied directly (container already running)
+5. Background job runs every 60s: for all lazy projects, if `now - last_request_at > idle_timeout`, stop container and clear `container_id`
 
-1. User toggles "Go Live" off
-2. Server DELETEs the matching route from Caddy admin API
-3. Server updates `deploy.yaml`: `live: false`
+**State: `down`**
+1. If container running: `docker stop <container_name>`
+2. If Caddy route exists: DELETE from Caddy admin API
+3. Sets `state: down`, clears `container_id`, `caddy_route_id`
+
+### Unpublish Project
+
+1. Stop container if running
+2. DELETE Caddy route using stored `caddy_route_id`
+3. Clear `container_id`, `caddy_route_id`, set `state: down`
 
 ---
 
@@ -262,7 +295,18 @@ Caddy is configured once. vibebox manages routes dynamically at runtime via Cadd
 
 **Cloudflare DNS (one-time):**
 - `*.yourdomain.com → <server IP>` (wildcard A record)
-- `vibebox.yourdomain.com → <server IP>` (or covered by wildcard)
+- `vibebox.yourdomain.com → <server IP>` (covered by wildcard)
+
+## Container Runtime
+
+Projects are deployed as containers. vibebox calls the container CLI directly — no Docker daemon SDK dependency.
+
+- Default: `docker` CLI
+- Alternative: `podman` (same CLI interface, daemonless, preferred on NixOS)
+- Configured via `CONTAINER_RUNTIME` env var
+- vibebox calls: `$CONTAINER_RUNTIME run|stop|inspect|rm ...`
+
+**Image requirement:** each project must have a `Dockerfile` (or pre-built image tag) to be publishable. vibebox does not build images — the user provides the image name in the Deploy tab.
 
 ---
 
@@ -282,12 +326,14 @@ Restart=on-failure
 
 ```
 PORT=3000
-BIND_HOST=100.x.x.x        # Tailscale IP; use 0.0.0.0 for local dev
+BIND_HOST=100.x.x.x          # Tailscale IP; use 0.0.0.0 for local dev
 PROJECTS_DIR=/home/user/projects
 VIBEZZZ_REPO=/home/user/projects/vibezzz
-DEFAULT_PROVIDER=claude      # claude | copilot
+DEFAULT_PROVIDER=claude        # claude | copilot
 DOMAIN=yourdomain.com
 CADDY_ADMIN_URL=http://localhost:2019
+CONTAINER_RUNTIME=docker       # docker | podman
+LAZY_IDLE_TIMEOUT=300          # default idle timeout in seconds for lazy containers
 ```
 
 ### NixOS
