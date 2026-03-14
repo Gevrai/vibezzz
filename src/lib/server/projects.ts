@@ -423,6 +423,7 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 		// Bootstrap the project directory. If any step fails, roll back the
 		// idea claim so it returns to 'raw' and isn't stranded as 'promoted'.
 		let realProjectDir: string | undefined;
+		let weCreatedProjectDir = false;
 		try {
 			// Create (or verify) the category directory, then re-resolve its
 			// real path immediately before creating the project subdirectory.
@@ -435,6 +436,7 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 			// Build all subsequent paths from the verified real parent
 			realProjectDir = join(realCategoryDir, opts.name);
 			await mkdir(realProjectDir); // atomic: throws EEXIST on race
+			weCreatedProjectDir = true;
 
 			const realVibezzzDir = await ensureVibezzzDir(realProjectDir);
 
@@ -504,7 +506,7 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 		} catch (bootstrapErr) {
 			// Roll back: return idea to 'raw' and remove any partially created directory
 			await unclaimIdea(opts.ideaId).catch(() => {});
-			if (realProjectDir) {
+			if (weCreatedProjectDir && realProjectDir) {
 				await rm(realProjectDir, { recursive: true, force: true }).catch(() => {});
 			}
 			throw bootstrapErr;

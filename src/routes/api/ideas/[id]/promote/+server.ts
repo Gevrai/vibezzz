@@ -8,8 +8,13 @@ export const POST: RequestHandler = async ({ params, request }) => {
 		return json({ error: 'Invalid idea id' }, { status: 400 });
 	}
 
-	const body = await request.json();
-	const { name, category, template } = body ?? {};
+	let body: unknown;
+	try {
+		body = await request.json();
+	} catch {
+		return json({ error: 'Invalid JSON body' }, { status: 400 });
+	}
+	const { name, category, template } = (body ?? {}) as Record<string, unknown>;
 
 	if (!name || typeof name !== 'string' || name.trim().length === 0) {
 		return json({ error: 'name is required' }, { status: 400 });
@@ -33,7 +38,7 @@ export const POST: RequestHandler = async ({ params, request }) => {
 			ideaId: id,
 			name: trimmedName,
 			category: trimmedCategory,
-			template: template || undefined
+			template: typeof template === 'string' ? template : undefined
 		});
 		return json(project, { status: 201 });
 	} catch (err) {
