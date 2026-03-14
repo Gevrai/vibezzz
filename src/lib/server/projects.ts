@@ -1,5 +1,5 @@
 import { join, relative, resolve } from 'node:path';
-import { readdir, stat, access, realpath, rm } from 'node:fs/promises';
+import { readdir, stat, lstat, access, realpath, rm, mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readYaml, writeYaml } from './yaml';
@@ -77,6 +77,16 @@ async function isDirectory(path: string): Promise<boolean> {
 	try {
 		const s = await stat(path);
 		return s.isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** Returns true only for real directories (not symlinks to directories). */
+async function isRealDirectory(path: string): Promise<boolean> {
+	try {
+		const s = await lstat(path);
+		return s.isDirectory() && !s.isSymbolicLink();
 	} catch {
 		return false;
 	}
@@ -167,7 +177,7 @@ export async function scanProjects(): Promise<ScannedProject[]> {
 
 	for (const category of categories) {
 		const categoryPath = join(projectsDir, category);
-		if (!await isDirectory(categoryPath)) continue;
+		if (!await isRealDirectory(categoryPath)) continue;
 
 		let entries: string[];
 		try {
@@ -178,7 +188,7 @@ export async function scanProjects(): Promise<ScannedProject[]> {
 
 		for (const entry of entries) {
 			const projectPath = join(categoryPath, entry);
-			if (!await isDirectory(projectPath)) continue;
+			if (!await isRealDirectory(projectPath)) continue;
 			if (!await isGitRepo(projectPath)) continue;
 
 			// Skip the vibezzz repo itself
@@ -241,6 +251,26 @@ export interface PromoteOptions {
 	template?: string;
 }
 
+// Per-destination lock to prevent concurrent promotions to the same path.
+const _promoteLocks = new Map<string, Promise<void>>();
+
+function withPromoteLock<T>(destPath: string, fn: () => Promise<T>): Promise<T> {
+	let release!: () => void;
+	const gate = new Promise<void>((r) => { release = r; });
+	const prev = _promoteLocks.get(destPath) ?? Promise.resolve();
+	_promoteLocks.set(destPath, gate);
+	return prev.then(async () => {
+		try {
+			return await fn();
+		} finally {
+			if (_promoteLocks.get(destPath) === gate) {
+				_promoteLocks.delete(destPath);
+			}
+			release();
+		}
+	});
+}
+
 export async function promoteIdeaToProject(opts: PromoteOptions): Promise<ScannedProject> {
 	const { projectsDir } = getConfig();
 
@@ -257,85 +287,94 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 	const vibezzzDir = join(projectDir, '.vibezzz');
 	const relPath = join(opts.category, opts.name);
 
-	// Check if directory already exists
-	if (await isDirectory(projectDir)) {
-		throw new Error(`Project directory already exists: ${relPath}`);
-	}
-
-	// Atomically claim the idea — prevents concurrent promotes from
-	// double-promoting the same idea into different projects.
-	await claimIdeaForPromotion(opts.ideaId, relPath);
-
-	// Bootstrap the project directory. If any step fails, roll back the
-	// idea claim so it returns to 'raw' and isn't stranded as 'promoted'.
-	try {
-		// Initialize git
-		try {
-			await execFileAsync('git', ['init', projectDir]);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : 'git init failed';
-			throw new Error(`git init failed: ${message}`);
+	// Serialize concurrent promotions targeting the same destination path
+	return withPromoteLock(relPath, async () => {
+		// Check if directory already exists
+		if (await isDirectory(projectDir)) {
+			throw new Error(`Project directory already exists: ${relPath}`);
 		}
 
-		// Create meta.yaml
-		const meta: ProjectMeta = {
-			name: opts.name,
-			category: opts.category,
-			origin: 'brain',
-			created_at: new Date().toISOString(),
-			idea_id: opts.ideaId,
-			template: opts.template || null,
-			project_stage: 'bootstrapping',
-			last_ready_at: null
-		};
-		await writeYaml(join(vibezzzDir, 'meta.yaml'), meta);
+		// Atomically claim the idea — prevents concurrent promotes from
+		// double-promoting the same idea into different projects.
+		await claimIdeaForPromotion(opts.ideaId, relPath);
 
-		// Create empty ideas.yaml
-		await writeYaml(join(vibezzzDir, 'ideas.yaml'), []);
+		// Bootstrap the project directory. If any step fails, roll back the
+		// idea claim so it returns to 'raw' and isn't stranded as 'promoted'.
+		try {
+			// Atomically create the project directory — mkdir without recursive
+			// fails with EEXIST if another process created it concurrently.
+			const categoryDir = join(projectsDir, opts.category);
+			await mkdir(categoryDir, { recursive: true });
+			await mkdir(projectDir); // atomic: throws EEXIST on race
 
-		// Create empty agents.yaml
-		await writeYaml(join(vibezzzDir, 'agents.yaml'), []);
-
-		// Create starter deploy.yaml
-		const deploy = {
-			preview: {
-				command: '',
-				port: 3001,
-				healthcheck_path: '/',
-				pid: null,
-				process_started_at: null,
-				status: 'stopped',
-				subdomain: `${opts.name}-preview`,
-				url: null,
-				public: true,
-				last_ready_at: null
-			},
-			publish: {
-				state: 'down',
-				subdomain: opts.name,
-				url: null,
-				image: null,
-				container_name: `vibebox-${opts.name}`,
-				container_id: null,
-				container_port: 3001,
-				idle_timeout: 300,
-				last_request_at: null,
-				caddy_route_id: `vibebox-${opts.name}`
-			},
-			automation: {
-				auto_start_agent: true,
-				auto_start_preview: true,
-				auto_notify_on_ready: true,
-				auto_publish: false
+			// Initialize git inside the already-created directory
+			try {
+				await execFileAsync('git', ['init', projectDir]);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : 'git init failed';
+				throw new Error(`git init failed: ${message}`);
 			}
-		};
-		await writeYaml(join(vibezzzDir, 'deploy.yaml'), deploy);
 
-		return { path: relPath, meta, signals: { ...DEFAULT_SIGNALS, preview_status: 'stopped', publish_state: 'down' } };
-	} catch (bootstrapErr) {
-		// Roll back: return idea to 'raw' and remove any partially created directory
-		await unclaimIdea(opts.ideaId).catch(() => {});
-		await rm(projectDir, { recursive: true, force: true }).catch(() => {});
-		throw bootstrapErr;
-	}
+			// Create meta.yaml
+			const meta: ProjectMeta = {
+				name: opts.name,
+				category: opts.category,
+				origin: 'brain',
+				created_at: new Date().toISOString(),
+				idea_id: opts.ideaId,
+				template: opts.template || null,
+				project_stage: 'bootstrapping',
+				last_ready_at: null
+			};
+			await writeYaml(join(vibezzzDir, 'meta.yaml'), meta);
+
+			// Create empty ideas.yaml
+			await writeYaml(join(vibezzzDir, 'ideas.yaml'), []);
+
+			// Create empty agents.yaml
+			await writeYaml(join(vibezzzDir, 'agents.yaml'), []);
+
+			// Create starter deploy.yaml
+			const deploy = {
+				preview: {
+					command: '',
+					port: 3001,
+					healthcheck_path: '/',
+					pid: null,
+					process_started_at: null,
+					status: 'stopped',
+					subdomain: `${opts.name}-preview`,
+					url: null,
+					public: true,
+					last_ready_at: null
+				},
+				publish: {
+					state: 'down',
+					subdomain: opts.name,
+					url: null,
+					image: null,
+					container_name: `vibebox-${opts.name}`,
+					container_id: null,
+					container_port: 3001,
+					idle_timeout: 300,
+					last_request_at: null,
+					caddy_route_id: `vibebox-${opts.name}`
+				},
+				automation: {
+					auto_start_agent: true,
+					auto_start_preview: true,
+					auto_notify_on_ready: true,
+					auto_publish: false
+				}
+			};
+			await writeYaml(join(vibezzzDir, 'deploy.yaml'), deploy);
+
+			return { path: relPath, meta, signals: { ...DEFAULT_SIGNALS, preview_status: 'stopped', publish_state: 'down' } };
+		} catch (bootstrapErr) {
+			// Roll back: return idea to 'raw' and remove any partially created directory
+			await unclaimIdea(opts.ideaId).catch(() => {});
+			await rm(projectDir, { recursive: true, force: true }).catch(() => {});
+			throw bootstrapErr;
+		}
+	});
 }
