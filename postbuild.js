@@ -17,13 +17,13 @@ const guard = `// --- ${MARKER} (injected by postbuild.js) ---
   if (_missing.length > 0) {
     throw new Error("Missing required environment variable(s): " + _missing.join(", "));
   }
-  // Map BIND_HOST → HOST so the Bun adapter binds to the correct interface.
-  if (!process.env.HOST) {
-    process.env.HOST = process.env.BIND_HOST;
-  }
-  // Validate PORT when explicitly set.
+  // BIND_HOST always wins — override any preset HOST.
+  process.env.HOST = process.env.BIND_HOST;
+  // Validate and normalize PORT so the Bun adapter never sees an invalid value.
   const _port = process.env.PORT;
-  if (_port != null && _port !== "") {
+  if (_port == null || _port === "") {
+    process.env.PORT = "3000";
+  } else {
     if (!/^\\d+$/.test(_port)) {
       throw new Error("PORT must be a valid integer (1\\u201365535), got: " + _port);
     }

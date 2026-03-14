@@ -5,5 +5,6 @@ import { loadBootConfig } from './boot-env.js';
 
 const boot = loadBootConfig();
 process.env.HOST = boot.host;
+process.env.PORT = String(boot.port);
 
 await import('./build/index.js');
