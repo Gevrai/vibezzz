@@ -11,12 +11,14 @@ vibebox-brain is the first sub-project of vibebox — a self-hosted, Tailscale-a
 
 ## Scope
 
-This spec covers vibebox-brain only. It is one of four planned vibebox sub-projects:
+vibebox is a single SvelteKit app built incrementally in phases. This spec covers Phase 1.
 
-1. **vibebox-brain** (this spec) — ideas inbox, synthesis, project tree
-2. vibebox-core — backend API, auth, process/project state management
-3. vibebox-deploy — deploy & port exposure management, domain routing
-4. vibebox-ui — unified dashboard bringing all sub-projects together
+| Phase | Scope |
+|-------|-------|
+| **1 — this spec** | Ideas inbox, synthesis, project tree |
+| 2 | Agent monitoring — see running Claude/Copilot processes per project |
+| 3 | Live/deploy status — port exposure, domain routing for internet-served projects |
+| 4 | Auth layer on top of Tailscale |
 
 ---
 
