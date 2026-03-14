@@ -151,6 +151,48 @@ async function resolveAndVerifyDir(dir: string, projectsDir: string): Promise<st
 	return resolved;
 }
 
+/**
+ * Verify that the .vibezzz subdirectory inside a verified project path is a
+ * real directory (not a symlink) whose resolved path stays inside the project.
+ * Returns the verified real path, or null if .vibezzz doesn't exist.
+ */
+export async function verifyVibezzzDir(projectRealPath: string): Promise<string | null> {
+	const vibezzzDir = join(projectRealPath, '.vibezzz');
+	let s;
+	try {
+		s = await lstat(vibezzzDir);
+	} catch {
+		return null;
+	}
+	if (!s.isDirectory() || s.isSymbolicLink()) {
+		return null;
+	}
+	const resolved = await realpath(vibezzzDir);
+	if (!resolved.startsWith(projectRealPath + '/')) {
+		return null;
+	}
+	return resolved;
+}
+
+/**
+ * Ensure the .vibezzz subdirectory exists inside a verified project path.
+ * Creates it if missing, then verifies it is a real directory contained within
+ * the project. Throws on symlink hops or containment violations.
+ */
+async function ensureVibezzzDir(projectRealPath: string): Promise<string> {
+	const vibezzzDir = join(projectRealPath, '.vibezzz');
+	await mkdir(vibezzzDir, { recursive: true });
+	const s = await lstat(vibezzzDir);
+	if (!s.isDirectory() || s.isSymbolicLink()) {
+		throw new Error('Invalid .vibezzz directory');
+	}
+	const resolved = await realpath(vibezzzDir);
+	if (!resolved.startsWith(projectRealPath + '/')) {
+		throw new Error('.vibezzz directory escapes project boundary');
+	}
+	return resolved;
+}
+
 const DEFAULT_SIGNALS: ProjectSignals = {
 	preview_status: 'stopped',
 	preview_url: null,
@@ -160,8 +202,7 @@ const DEFAULT_SIGNALS: ProjectSignals = {
 	last_agent_status: null
 };
 
-async function readSignals(projectAbsPath: string): Promise<ProjectSignals> {
-	const vibezzzDir = join(projectAbsPath, '.vibezzz');
+async function readSignals(vibezzzDir: string): Promise<ProjectSignals> {
 	const signals: ProjectSignals = { ...DEFAULT_SIGNALS };
 
 	// Read deploy.yaml for preview/publish status
@@ -247,9 +288,15 @@ export async function scanProjects(): Promise<ScannedProject[]> {
 			// Skip the vibezzz repo itself
 			if (realProjectPath === vibezzzRepo) continue;
 
-			const metaPath = join(realProjectPath, '.vibezzz', 'meta.yaml');
-			const meta = await readYaml<ProjectMeta | null>(metaPath, null);
-			const signals = await readSignals(realProjectPath);
+			const realVibezzzDir = await verifyVibezzzDir(realProjectPath);
+			let meta: ProjectMeta | null = null;
+			let signals: ProjectSignals;
+			if (realVibezzzDir) {
+				meta = await readYaml<ProjectMeta | null>(join(realVibezzzDir, 'meta.yaml'), null);
+				signals = await readSignals(realVibezzzDir);
+			} else {
+				signals = { ...DEFAULT_SIGNALS };
+			}
 
 			const relPath = join(category, entry);
 			if (meta) {
@@ -303,7 +350,13 @@ export async function resyncProjects(): Promise<ScannedProject[]> {
 			continue;
 		}
 
-		const metaPath = join(realAbsPath, '.vibezzz', 'meta.yaml');
+		let realVibezzzDir: string;
+		try {
+			realVibezzzDir = await ensureVibezzzDir(realAbsPath);
+		} catch {
+			continue;
+		}
+		const metaPath = join(realVibezzzDir, 'meta.yaml');
 		const existing = await readYaml<ProjectMeta | null>(metaPath, null);
 
 		if (!existing) {
@@ -369,6 +422,7 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 
 		// Bootstrap the project directory. If any step fails, roll back the
 		// idea claim so it returns to 'raw' and isn't stranded as 'promoted'.
+		let realProjectDir: string | undefined;
 		try {
 			// Create (or verify) the category directory, then re-resolve its
 			// real path immediately before creating the project subdirectory.
@@ -379,10 +433,10 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 			const realCategoryDir = await resolveAndVerifyDir(categoryDir, projectsDir);
 
 			// Build all subsequent paths from the verified real parent
-			const realProjectDir = join(realCategoryDir, opts.name);
+			realProjectDir = join(realCategoryDir, opts.name);
 			await mkdir(realProjectDir); // atomic: throws EEXIST on race
 
-			const realVibezzzDir = join(realProjectDir, '.vibezzz');
+			const realVibezzzDir = await ensureVibezzzDir(realProjectDir);
 
 			// Initialize git inside the already-created directory
 			try {
@@ -450,7 +504,9 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 		} catch (bootstrapErr) {
 			// Roll back: return idea to 'raw' and remove any partially created directory
 			await unclaimIdea(opts.ideaId).catch(() => {});
-			await rm(projectDir, { recursive: true, force: true }).catch(() => {});
+			if (realProjectDir) {
+				await rm(realProjectDir, { recursive: true, force: true }).catch(() => {});
+			}
 			throw bootstrapErr;
 		}
 	});

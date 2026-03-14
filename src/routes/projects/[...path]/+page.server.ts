@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { readYaml } from '$lib/server/yaml';
 import { getConfig } from '$lib/server/config';
 import { error } from '@sveltejs/kit';
+import { verifyVibezzzDir } from '$lib/server/projects';
 import type { ProjectMeta, ProjectSignals, DeployPreview, DeployPublish, AgentEntry } from '$lib/server/projects';
 import { realpath } from 'node:fs/promises';
 
@@ -29,12 +30,13 @@ export const load: PageServerLoad = async ({ params }) => {
 		throw error(400, 'Invalid project path');
 	}
 
-	// Use the resolved real path for all subsequent I/O to close the TOCTOU
-	// window between the realpath check above and the file reads below.
-	const vibezzzDir = join(resolvedPath, '.vibezzz');
-	const metaPath = join(vibezzzDir, 'meta.yaml');
+	// Verify .vibezzz is a real directory (not a symlink) before reading through it
+	const vibezzzDir = await verifyVibezzzDir(resolvedPath);
 
-	let meta = await readYaml<ProjectMeta | null>(metaPath, null);
+	let meta: ProjectMeta | null = null;
+	if (vibezzzDir) {
+		meta = await readYaml<ProjectMeta | null>(join(vibezzzDir, 'meta.yaml'), null);
+	}
 
 	// External repo without .vibezzz/meta.yaml — synthesize metadata
 	if (!meta) {
@@ -64,10 +66,12 @@ export const load: PageServerLoad = async ({ params }) => {
 		last_agent_status: null
 	};
 
-	const deploy = await readYaml<{ preview?: DeployPreview; publish?: DeployPublish } | null>(
-		join(vibezzzDir, 'deploy.yaml'),
-		null
-	);
+	const deploy = vibezzzDir
+		? await readYaml<{ preview?: DeployPreview; publish?: DeployPublish } | null>(
+				join(vibezzzDir, 'deploy.yaml'),
+				null
+			)
+		: null;
 	if (deploy) {
 		if (deploy.preview) {
 			signals.preview_status = deploy.preview.status ?? null;
@@ -79,7 +83,9 @@ export const load: PageServerLoad = async ({ params }) => {
 		}
 	}
 
-	const agents = await readYaml<AgentEntry[]>(join(vibezzzDir, 'agents.yaml'), []);
+	const agents = vibezzzDir
+		? await readYaml<AgentEntry[]>(join(vibezzzDir, 'agents.yaml'), [])
+		: [];
 	if (agents.length > 0) {
 		const last = agents[agents.length - 1];
 		signals.last_agent_status = last.status ?? null;
