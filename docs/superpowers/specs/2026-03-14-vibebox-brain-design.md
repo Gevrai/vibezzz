@@ -56,6 +56,7 @@ This spec covers vibebox-brain only. It is one of four planned vibebox sub-proje
   status: raw          # raw | promoted | implemented
   implemented_at: null
   git_tag: null        # e.g. "idea/1-build-a-thing", set when marked implemented
+  project_path: null   # e.g. "js/my-app", set when promoted (global ideas.yaml only)
 ```
 
 ### .vibezzz/meta.yaml schema
@@ -82,8 +83,8 @@ interface AIProvider {
 ```
 
 Implementations:
-- `ClaudeProvider` — spawns `claude --print "<prompt>"`
-- `CopilotProvider` — spawns `copilot "<prompt>"`
+- `ClaudeProvider` — spawns `claude --print "<prompt>"` — prompt passed as a separate argument to `Bun.spawn()`, never interpolated into a shell string (prevents injection)
+- `CopilotProvider` — spawns `copilot "<prompt>"` — same safe spawn approach
 
 Provider is selectable per-action in the UI. Adding a new provider = one new class implementing the interface. The active provider is persisted in the user's session or defaulted from `DEFAULT_PROVIDER` env var.
 
@@ -104,6 +105,17 @@ Provider is selectable per-action in the UI. Adding a new provider = one new cla
 - "Synthesize" button — triggers on-demand AI synthesis of all raw ideas
 - Output: AI-generated ranked summary with reasoning per idea
 - Synthesis is stateless — output is not persisted, regenerate any time
+
+**Synthesis prompt template:**
+```
+You are a creative project advisor. Below is a list of raw ideas.
+Rank them from most to least promising based on originality, feasibility, and impact.
+For each idea, provide a one-sentence rationale.
+Return the result as a numbered ranked list.
+
+Ideas:
+<idea list, one per line>
+```
 
 ### `/projects`
 
@@ -144,7 +156,7 @@ Provider is selectable per-action in the UI. Adding a new provider = one new cla
 3. For each found project:
    - If `.vibezzz/meta.yaml` exists: read it
    - If not: create `.vibezzz/meta.yaml` with `origin: external`, infer category from path
-4. Projects in the tree that no longer exist on disk are flagged as `missing` in the UI (not deleted)
+4. Projects in the tree that no longer exist on disk are flagged as `missing` in the UI — this is a transient UI-only state, not written to disk. The project entry disappears on next successful Resync.
 5. UI refreshes the project tree
 
 ### Move Project
@@ -157,7 +169,7 @@ Provider is selectable per-action in the UI. Adding a new provider = one new cla
 ### Mark Idea as Implemented
 
 1. User clicks "Mark Implemented" on a project-scoped idea
-2. Server runs `git tag idea/<id>-<slug>` in the project directory
+2. Server runs `git tag idea/<id>-<slug>` in the project directory. **Known limitation:** git tagging requires at least one commit — if the project has just been initialized (`git init` only), the UI should show a warning instead of attempting the tag.
 3. Server updates `.vibezzz/ideas.yaml`: sets `status: implemented`, `implemented_at`, `git_tag`
 4. UI shows git tag badge on the idea card
 
@@ -180,7 +192,7 @@ Bound to the Tailscale interface IP. No public exposure in v1 — auth layer is 
 
 ```
 PORT=3000
-TAILSCALE_IP=100.x.x.x       # bind address
+BIND_HOST=100.x.x.x    # Tailscale IP in production; use 0.0.0.0 for local dev
 PROJECTS_DIR=/home/user/projects
 VIBEZZZ_REPO=/home/user/projects/vibezzz
 DEFAULT_PROVIDER=claude        # claude | copilot
