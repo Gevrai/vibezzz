@@ -32,7 +32,8 @@
 				body: JSON.stringify(payload)
 			});
 			if (res.ok) {
-				window.location.reload();
+				const project = await res.json();
+				window.location.href = `/projects/${project.path}`;
 			} else {
 				const err = await res.json();
 				alert(err.error || 'Promotion failed');

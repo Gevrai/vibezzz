@@ -91,12 +91,12 @@
 										{#if project.signals.agent_active}
 											<span class="rounded-full bg-purple-500/20 px-2 py-0.5 text-xs font-medium text-purple-400">🤖</span>
 										{/if}
-										{#if project.signals.preview_status && project.signals.preview_status !== 'stopped'}
+										{#if project.signals.preview_status}
 											<span class="rounded-full px-2 py-0.5 text-xs font-medium {previewColors[project.signals.preview_status] || 'bg-gray-500/20 text-gray-400'}">
 												preview {project.signals.preview_status}
 											</span>
 										{/if}
-										{#if project.signals.publish_state && project.signals.publish_state !== 'down'}
+										{#if project.signals.publish_state}
 											<span class="rounded-full px-2 py-0.5 text-xs font-medium {publishColors[project.signals.publish_state] || 'bg-gray-500/20 text-gray-400'}">
 												publish {project.signals.publish_state}
 											</span>
@@ -109,10 +109,10 @@
 										<span>idea #{project.meta.idea_id}</span>
 									{/if}
 									{#if project.signals.preview_url}
-										<span class="text-cyan-400">🔗 preview</span>
+										<span class="text-cyan-400" title={project.signals.preview_url}>🔗 {project.signals.preview_url}</span>
 									{/if}
 									{#if project.signals.publish_url}
-										<span class="text-green-400">🌐 public</span>
+										<span class="text-green-400" title={project.signals.publish_url}>🌐 {project.signals.publish_url}</span>
 									{/if}
 								</div>
 							</a>
