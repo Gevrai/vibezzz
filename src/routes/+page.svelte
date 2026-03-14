@@ -6,6 +6,7 @@
 	let showPromote = $state<number | null>(null);
 	let promoteName = $state('');
 	let promoteCategory = $state('');
+	let promoteTemplate = $state('');
 	let promoting = $state(false);
 
 	const statusColors: Record<string, string> = {
@@ -18,10 +19,17 @@
 		if (!promoteName.trim() || !promoteCategory.trim()) return;
 		promoting = true;
 		try {
+			const payload: Record<string, string> = {
+				name: promoteName.trim(),
+				category: promoteCategory.trim()
+			};
+			if (promoteTemplate.trim()) {
+				payload.template = promoteTemplate.trim();
+			}
 			const res = await fetch(`/api/ideas/${ideaId}/promote`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ name: promoteName.trim(), category: promoteCategory.trim() })
+				body: JSON.stringify(payload)
 			});
 			if (res.ok) {
 				window.location.reload();
@@ -102,6 +110,7 @@
 								showPromote = showPromote === idea.id ? null : idea.id;
 								promoteName = '';
 								promoteCategory = '';
+								promoteTemplate = '';
 							}}
 							class="shrink-0 rounded-md border border-gray-700 px-3 py-1 text-xs text-gray-300 transition-colors hover:border-blue-500 hover:text-blue-400"
 						>
@@ -121,6 +130,11 @@
 							bind:value={promoteName}
 							placeholder="Project name"
 							class="flex-1 rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-100 placeholder-gray-500 focus:border-blue-500 focus:outline-none"
+						/>
+						<input
+							bind:value={promoteTemplate}
+							placeholder="Template (optional)"
+							class="w-36 rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-100 placeholder-gray-500 focus:border-blue-500 focus:outline-none"
 						/>
 						<button
 							onclick={() => promote(idea.id)}

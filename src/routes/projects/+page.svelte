@@ -15,6 +15,19 @@
 		external: 'bg-gray-500/20 text-gray-400'
 	};
 
+	const previewColors: Record<string, string> = {
+		ready: 'bg-cyan-500/20 text-cyan-400',
+		starting: 'bg-yellow-500/20 text-yellow-400',
+		stopped: 'bg-gray-500/20 text-gray-400',
+		error: 'bg-red-500/20 text-red-400'
+	};
+
+	const publishColors: Record<string, string> = {
+		up: 'bg-green-500/20 text-green-400',
+		lazy: 'bg-yellow-500/20 text-yellow-400',
+		down: 'bg-gray-500/20 text-gray-400'
+	};
+
 	async function resync() {
 		syncing = true;
 		try {
@@ -75,12 +88,31 @@
 										<span class="rounded-full px-2 py-0.5 text-xs font-medium {stageColors[project.meta.project_stage] || ''}">
 											{project.meta.project_stage.replace('_', ' ')}
 										</span>
+										{#if project.signals.agent_active}
+											<span class="rounded-full bg-purple-500/20 px-2 py-0.5 text-xs font-medium text-purple-400">🤖</span>
+										{/if}
+										{#if project.signals.preview_status && project.signals.preview_status !== 'stopped'}
+											<span class="rounded-full px-2 py-0.5 text-xs font-medium {previewColors[project.signals.preview_status] || 'bg-gray-500/20 text-gray-400'}">
+												preview {project.signals.preview_status}
+											</span>
+										{/if}
+										{#if project.signals.publish_state && project.signals.publish_state !== 'down'}
+											<span class="rounded-full px-2 py-0.5 text-xs font-medium {publishColors[project.signals.publish_state] || 'bg-gray-500/20 text-gray-400'}">
+												publish {project.signals.publish_state}
+											</span>
+										{/if}
 									</div>
 								</div>
-								<div class="mt-1.5 text-xs text-gray-500">
-									{project.path}
+								<div class="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+									<span>{project.path}</span>
 									{#if project.meta.idea_id}
-										<span class="ml-2">idea #{project.meta.idea_id}</span>
+										<span>idea #{project.meta.idea_id}</span>
+									{/if}
+									{#if project.signals.preview_url}
+										<span class="text-cyan-400">🔗 preview</span>
+									{/if}
+									{#if project.signals.publish_url}
+										<span class="text-green-400">🌐 public</span>
 									{/if}
 								</div>
 							</a>

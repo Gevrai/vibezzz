@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { promoteIdeaToProject } from '$lib/server/projects';
+import { promoteIdeaToProject, isValidPathSegment } from '$lib/server/projects';
 
 export const POST: RequestHandler = async ({ params, request }) => {
 	const id = Number(params.id);
@@ -18,11 +18,21 @@ export const POST: RequestHandler = async ({ params, request }) => {
 		return json({ error: 'category is required' }, { status: 400 });
 	}
 
+	const trimmedName = name.trim();
+	const trimmedCategory = category.trim();
+
+	if (!isValidPathSegment(trimmedCategory)) {
+		return json({ error: 'category contains invalid characters' }, { status: 400 });
+	}
+	if (!isValidPathSegment(trimmedName)) {
+		return json({ error: 'name contains invalid characters' }, { status: 400 });
+	}
+
 	try {
 		const project = await promoteIdeaToProject({
 			ideaId: id,
-			name: name.trim(),
-			category: category.trim(),
+			name: trimmedName,
+			category: trimmedCategory,
 			template: template || undefined
 		});
 		return json(project, { status: 201 });
