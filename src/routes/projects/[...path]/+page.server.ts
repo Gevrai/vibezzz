@@ -29,7 +29,9 @@ export const load: PageServerLoad = async ({ params }) => {
 		throw error(400, 'Invalid project path');
 	}
 
-	const vibezzzDir = join(absPath, '.vibezzz');
+	// Use the resolved real path for all subsequent I/O to close the TOCTOU
+	// window between the realpath check above and the file reads below.
+	const vibezzzDir = join(resolvedPath, '.vibezzz');
 	const metaPath = join(vibezzzDir, 'meta.yaml');
 
 	let meta = await readYaml<ProjectMeta | null>(metaPath, null);

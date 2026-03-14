@@ -1,4 +1,4 @@
-import { join, relative, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { readdir, stat, lstat, access, realpath, rm, mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -96,8 +96,11 @@ async function isRealDirectory(path: string): Promise<boolean> {
  * Resolve symlinks and verify the real path stays inside the projects root.
  * Falls back to lexical `resolve()` when the path doesn't exist yet (e.g.
  * during promotion before `git init` creates the directory).
+ *
+ * Returns the resolved target path so callers can use it for subsequent I/O,
+ * closing the TOCTOU window between validation and use.
  */
-async function assertInsideProjectsDir(targetPath: string, projectsDir: string): Promise<void> {
+async function assertInsideProjectsDir(targetPath: string, projectsDir: string): Promise<string> {
 	let resolvedTarget: string;
 	let resolvedRoot: string;
 	try {
@@ -122,6 +125,30 @@ async function assertInsideProjectsDir(targetPath: string, projectsDir: string):
 	if (!resolvedTarget.startsWith(resolvedRoot + '/')) {
 		throw new Error('Invalid project path');
 	}
+	return resolvedTarget;
+}
+
+/**
+ * Resolve the real path of an existing directory and verify it stays inside
+ * the projects root. Unlike assertInsideProjectsDir, this requires the path
+ * to exist and be a real directory (not a symlink).
+ */
+async function resolveAndVerifyDir(dir: string, projectsDir: string): Promise<string> {
+	const s = await lstat(dir);
+	if (!s.isDirectory() || s.isSymbolicLink()) {
+		throw new Error('Invalid project path');
+	}
+	const resolved = await realpath(dir);
+	let resolvedRoot: string;
+	try {
+		resolvedRoot = await realpath(projectsDir);
+	} catch {
+		resolvedRoot = resolve(projectsDir);
+	}
+	if (!resolved.startsWith(resolvedRoot + '/') && resolved !== resolvedRoot) {
+		throw new Error('Invalid project path');
+	}
+	return resolved;
 }
 
 const DEFAULT_SIGNALS: ProjectSignals = {
@@ -168,46 +195,73 @@ export async function scanProjects(): Promise<ScannedProject[]> {
 	const { projectsDir, vibezzzRepo } = getConfig();
 	const projects: ScannedProject[] = [];
 
+	let resolvedProjectsDir: string;
+	try {
+		resolvedProjectsDir = await realpath(projectsDir);
+	} catch {
+		return [];
+	}
+
 	let categories: string[];
 	try {
-		categories = await readdir(projectsDir);
+		categories = await readdir(resolvedProjectsDir);
 	} catch {
 		return [];
 	}
 
 	for (const category of categories) {
-		const categoryPath = join(projectsDir, category);
-		if (!await isRealDirectory(categoryPath)) continue;
+		if (!isValidPathSegment(category)) continue;
+		const categoryPath = join(resolvedProjectsDir, category);
+
+		// Re-resolve and verify the category is still a real directory inside
+		// the projects root to close the TOCTOU gap between the readdir above
+		// and the readdir of its children below.
+		let realCategoryPath: string;
+		try {
+			realCategoryPath = await resolveAndVerifyDir(categoryPath, resolvedProjectsDir);
+		} catch {
+			continue;
+		}
 
 		let entries: string[];
 		try {
-			entries = await readdir(categoryPath);
+			entries = await readdir(realCategoryPath);
 		} catch {
 			continue;
 		}
 
 		for (const entry of entries) {
-			const projectPath = join(categoryPath, entry);
-			if (!await isRealDirectory(projectPath)) continue;
-			if (!await isGitRepo(projectPath)) continue;
+			if (!isValidPathSegment(entry)) continue;
+			const projectPath = join(realCategoryPath, entry);
+
+			// Re-resolve the project directory at point of use
+			let realProjectPath: string;
+			try {
+				realProjectPath = await resolveAndVerifyDir(projectPath, resolvedProjectsDir);
+			} catch {
+				continue;
+			}
+
+			if (!await isGitRepo(realProjectPath)) continue;
 
 			// Skip the vibezzz repo itself
-			if (projectPath === vibezzzRepo) continue;
+			if (realProjectPath === vibezzzRepo) continue;
 
-			const metaPath = join(projectPath, '.vibezzz', 'meta.yaml');
+			const metaPath = join(realProjectPath, '.vibezzz', 'meta.yaml');
 			const meta = await readYaml<ProjectMeta | null>(metaPath, null);
-			const signals = await readSignals(projectPath);
+			const signals = await readSignals(realProjectPath);
 
+			const relPath = join(category, entry);
 			if (meta) {
 				projects.push({
-					path: relative(projectsDir, projectPath),
+					path: relPath,
 					meta,
 					signals
 				});
 			} else {
 				// External project without vibebox metadata
 				projects.push({
-					path: relative(projectsDir, projectPath),
+					path: relPath,
 					meta: {
 						name: entry,
 						category,
@@ -231,9 +285,25 @@ export async function resyncProjects(): Promise<ScannedProject[]> {
 	const { projectsDir } = getConfig();
 	const projects = await scanProjects();
 
+	let resolvedProjectsDir: string;
+	try {
+		resolvedProjectsDir = await realpath(projectsDir);
+	} catch {
+		resolvedProjectsDir = resolve(projectsDir);
+	}
+
 	for (const project of projects) {
-		const absPath = join(projectsDir, project.path);
-		const metaPath = join(absPath, '.vibezzz', 'meta.yaml');
+		// Re-resolve the project path at point of use to avoid writing to a
+		// path that was swapped for a symlink after scanProjects returned.
+		const absPath = join(resolvedProjectsDir, project.path);
+		let realAbsPath: string;
+		try {
+			realAbsPath = await resolveAndVerifyDir(absPath, resolvedProjectsDir);
+		} catch {
+			continue;
+		}
+
+		const metaPath = join(realAbsPath, '.vibezzz', 'meta.yaml');
 		const existing = await readYaml<ProjectMeta | null>(metaPath, null);
 
 		if (!existing) {
@@ -281,10 +351,9 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 
 	const projectDir = join(projectsDir, opts.category, opts.name);
 
-	// Ensure the resolved path stays inside PROJECTS_DIR (symlink-safe)
+	// Initial containment check (symlink-safe)
 	await assertInsideProjectsDir(projectDir, projectsDir);
 
-	const vibezzzDir = join(projectDir, '.vibezzz');
 	const relPath = join(opts.category, opts.name);
 
 	// Serialize concurrent promotions targeting the same destination path
@@ -301,15 +370,23 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 		// Bootstrap the project directory. If any step fails, roll back the
 		// idea claim so it returns to 'raw' and isn't stranded as 'promoted'.
 		try {
-			// Atomically create the project directory — mkdir without recursive
-			// fails with EEXIST if another process created it concurrently.
+			// Create (or verify) the category directory, then re-resolve its
+			// real path immediately before creating the project subdirectory.
+			// This closes the TOCTOU window: we verify the parent is still a
+			// real directory inside PROJECTS_DIR right before mkdir.
 			const categoryDir = join(projectsDir, opts.category);
 			await mkdir(categoryDir, { recursive: true });
-			await mkdir(projectDir); // atomic: throws EEXIST on race
+			const realCategoryDir = await resolveAndVerifyDir(categoryDir, projectsDir);
+
+			// Build all subsequent paths from the verified real parent
+			const realProjectDir = join(realCategoryDir, opts.name);
+			await mkdir(realProjectDir); // atomic: throws EEXIST on race
+
+			const realVibezzzDir = join(realProjectDir, '.vibezzz');
 
 			// Initialize git inside the already-created directory
 			try {
-				await execFileAsync('git', ['init', projectDir]);
+				await execFileAsync('git', ['init', realProjectDir]);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : 'git init failed';
 				throw new Error(`git init failed: ${message}`);
@@ -326,13 +403,13 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 				project_stage: 'bootstrapping',
 				last_ready_at: null
 			};
-			await writeYaml(join(vibezzzDir, 'meta.yaml'), meta);
+			await writeYaml(join(realVibezzzDir, 'meta.yaml'), meta);
 
 			// Create empty ideas.yaml
-			await writeYaml(join(vibezzzDir, 'ideas.yaml'), []);
+			await writeYaml(join(realVibezzzDir, 'ideas.yaml'), []);
 
 			// Create empty agents.yaml
-			await writeYaml(join(vibezzzDir, 'agents.yaml'), []);
+			await writeYaml(join(realVibezzzDir, 'agents.yaml'), []);
 
 			// Create starter deploy.yaml
 			const deploy = {
@@ -367,7 +444,7 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 					auto_publish: false
 				}
 			};
-			await writeYaml(join(vibezzzDir, 'deploy.yaml'), deploy);
+			await writeYaml(join(realVibezzzDir, 'deploy.yaml'), deploy);
 
 			return { path: relPath, meta, signals: { ...DEFAULT_SIGNALS, preview_status: 'stopped', publish_state: 'down' } };
 		} catch (bootstrapErr) {
