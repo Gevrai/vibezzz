@@ -1,26 +1,70 @@
-# vibebox Design Spec
+# vibebox Brain Design Spec
 
 **Date:** 2026-03-14
-**Status:** Approved
+**Status:** Revised
 
 ## Overview
 
-vibebox is a self-hosted, Tailscale-accessible SvelteKit web app for capturing ideas, managing development projects, monitoring AI agents, and serving projects live on the internet. It is fully file-based (YAML + git) — no database. Both humans and AI agents read and write the same files.
+vibebox is a self-hosted, Tailscale-accessible SvelteKit web app for capturing ideas, turning them into real projects, running coding agents on them, exposing previews, and publishing projects to the internet from the same machine.
 
-Accessible from any device on Tailscale (phone, laptop, etc.). Projects live on the host machine under a configurable `PROJECTS_DIR`. Public internet exposure uses wildcard DNS + Caddy dynamic routing, managed entirely from the vibebox UI.
+The primary design goal is not generic project management. It is a fun, ergonomic personal async-builder loop:
+
+1. Capture an idea from anywhere
+2. Promote it to a project
+3. Automatically start implementation on the server
+4. Expose a preview URL when it is testable
+5. Notify the user with a link
+6. Optionally promote that preview into a stable public deployment
+7. Iterate projects with more ideas and agent runs over time, all backed up in GitHub.
+
+vibebox remains fully file-based (YAML + git) — no database. Humans and AI agents read and write the same project files. The app is single-user by design and optimized for personal projects rather than team workflows.
+
+Public access is routed through Caddy. Cloudflare can sit in front either as wildcard DNS or a tunnel ingress, depending on host setup. The vibebox UI itself stays private behind Tailscale.
+
+---
+
+## Product Shape
+
+vibebox has two distinct access modes:
+
+- **Control plane:** the vibebox web UI, reachable over Tailscale only
+- **Project plane:** preview and published project URLs, reachable publicly through Caddy + Cloudflare
+
+The product should feel like a personal workshop, not an ops console. The happy path is:
+
+`idea -> project -> agent run -> preview ready -> notification -> publish if worth keeping`
+
+Deployment features matter, but they support that loop rather than define it.
 
 ---
 
 ## Scope
 
-vibebox is a single SvelteKit app built in three phases, all covered by this spec. Auth is explicitly out of scope — Tailscale provides access control.
+This spec covers three phases inside one SvelteKit app.
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 1 | Ideas inbox, synthesis, project tree | This spec |
-| 2 | Agent monitoring — running Claude/Copilot processes per project | This spec |
-| 3 | Live/deploy — port exposure, domain routing via Caddy | This spec |
+| Phase | Scope | Role in product |
+|-------|-------|-----------------|
+| 1 | Idea capture, project bootstrap, agent runs, live logs, preview URLs, notifications | Core joy loop |
+| 2 | Stable public publish via container + routed subdomain | MVP completion |
+| 3 | Lazy containers, route reconciliation polish, operational safety refinements | Optimization |
 | 4 | Auth layer on top of Tailscale | Out of scope |
+
+### Core product promise
+
+If the user is away from their desk and has an idea, they should be able to capture it, promote it, let vibebox build it, and later receive a link when it is ready to test.
+
+### MVP boundary
+
+MVP includes:
+
+- global inbox
+- project promotion + bootstrap
+- long-running agent runs with logs
+- preview start/stop and preview URLs
+- notification when a preview becomes ready
+- one-click stable publish using a container image
+
+MVP does **not** require lazy containers to be perfect. They are useful, but the preview/publish loop matters more than idle optimization.
 
 ---
 
@@ -28,111 +72,187 @@ vibebox is a single SvelteKit app built in three phases, all covered by this spe
 
 | Layer | Choice | Reason |
 |---|---|---|
-| Framework | SvelteKit 5 + Svelte 5 | Lightweight, SSR built-in, excellent for self-hosted tools |
-| Runtime | Bun | Fast startup, built-in YAML support, clean `Bun.spawn()` API |
-| Adapter | `svelte-adapter-bun` | Bun-native SvelteKit deployment |
-| Storage | YAML files | File-based, git-tracked, human and agent readable — no database |
-| Reverse proxy | Caddy | Dynamic vhost config via admin API, automatic HTTPS |
-| Styling | TailwindCSS | Utility-first, mobile-friendly |
+| Framework | SvelteKit 5 + Svelte 5 | Lightweight, SSR built-in, good fit for a self-hosted control plane |
+| Runtime | Bun | Fast startup, simple subprocess APIs, good ergonomics for YAML/file workflows |
+| Adapter | `svelte-adapter-bun` | Bun-native deployment |
+| Storage | YAML files + git repos | Agent-readable, inspectable, portable, easy to back up |
+| Reverse proxy | Caddy | Dynamic host routing via admin API |
+| Styling | TailwindCSS | Fast iteration and mobile-friendly layouts |
+| Notifications | Generic webhook | Simple integration with ntfy, Pushover, Discord, Telegram bridges, etc. |
 
 ---
 
 ## File Layout
 
-```
-~/projects/vibezzz/           ← this repo (vibebox itself)
-└── ideas.yaml                ← global ideas inbox (pre-promotion)
+```text
+~/projects/vibezzz/                 ← this repo (vibebox itself)
+└── ideas.yaml                      ← global ideas inbox
 
-~/projects/                   ← PROJECTS_DIR (configurable via .env)
+~/projects/                         ← PROJECTS_DIR (configurable via .env)
 └── <category>/
     └── <project>/
         ├── .git/
         └── .vibezzz/
-            ├── ideas.yaml    ← project-scoped ideas
-            ├── meta.yaml     ← project metadata
-            ├── agents.yaml   ← agent run history
-            └── deploy.yaml   ← deploy configuration
+            ├── ideas.yaml          ← project-scoped ideas
+            ├── meta.yaml           ← project metadata + high-level stage
+            ├── agents.yaml         ← agent run history
+            ├── deploy.yaml         ← preview + publish configuration
+            └── logs/
+                └── <agent-id>.log  ← captured stdout/stderr for each run
 ```
 
-### ideas.yaml schema (global and project-scoped)
+All writes to YAML files must use atomic write semantics:
+
+1. read current file
+2. apply change in memory
+3. write to temporary file in same directory
+4. rename over original file
+
+That is required because the UI server and agent processes may touch the same project state over time.
+
+### `ideas.yaml` schema
+
+Used both globally and inside each project.
 
 ```yaml
 - id: 1
-  content: "build a thing"
+  content: "build a tiny multiplayer music queue"
   created_at: 2026-03-14T10:00:00Z
-  status: raw          # raw | promoted | implemented
+  status: raw              # raw | promoted | implemented
+  project_path: null       # set in global ideas.yaml after promotion
   implemented_at: null
-  git_tag: null        # e.g. "idea/1-build-a-thing", set when marked implemented
-  project_path: null   # e.g. "js/my-app", set when promoted (global ideas.yaml only)
+  git_tag: null
 ```
 
-### .vibezzz/meta.yaml schema
+### `.vibezzz/meta.yaml` schema
 
 ```yaml
-name: my-app
+name: music-queue
 category: js
-origin: brain          # brain | external
+origin: brain             # brain | external
 created_at: 2026-03-14T10:00:00Z
-idea_id: 1             # id from global ideas.yaml; null for external projects
+idea_id: 1                # null for external projects
+template: sveltekit       # optional starter/template used at bootstrap
+project_stage: building   # bootstrapping | building | preview_ready | published | paused
+last_ready_at: null
 ```
 
-### .vibezzz/agents.yaml schema
+`project_stage` is a user-facing high-level status used on project cards and notifications. It is intentionally coarse and should stay easy to understand on mobile.
+
+### `.vibezzz/agents.yaml` schema
 
 ```yaml
 - id: 1
-  provider: claude       # claude | copilot
-  summary: "implement auth from idea #3"
+  provider: claude            # claude | copilot
+  kind: implement             # bootstrap | implement | refine | custom
+  summary: "Create MVP from promoted idea #3"
   started_at: 2026-03-14T10:00:00Z
-  finished_at: 2026-03-14T10:05:00Z
-  status: done           # running | done | failed
-  pid: 12345             # OS process ID; null when finished
-  idea_id: 3             # nullable — which idea triggered this agent run
+  finished_at: null
+  status: running             # running | done | failed | stopped
+  pid: 12345
+  process_started_at: 2026-03-14T10:00:00Z
+  cwd: /home/user/projects/js/music-queue
+  idea_id: 3
+  log_path: .vibezzz/logs/1.log
+  exit_code: null
+  branch: main
+  commit_sha: null
+  result: building           # building | ready_for_test | blocked | failed
+  preview_url: null
 ```
 
-Active agent processes are also tracked in-memory by the Bun server (keyed by PID) for real-time status. On process exit the server writes the result back to `agents.yaml`.
+Agent runs are append-only history. Active runs are also tracked in memory by the Bun server for log streaming and stop actions.
 
-**Startup reconciliation:** On vibebox startup, the server scans all `.vibezzz/agents.yaml` files for entries with `status: running`, checks whether the stored PID is still alive (`process.kill(pid, 0)`), and updates any stale entries to `status: failed`.
+**Startup reconciliation:** on vibebox startup, scan all `.vibezzz/agents.yaml` files for entries with `status: running`. A run is only considered still alive if:
 
-### .vibezzz/deploy.yaml schema
+- the PID exists
+- the process start time matches `process_started_at`
+- the process still belongs to the expected project working directory
+
+Otherwise mark the run `failed` or `stopped` and record `finished_at`.
+
+### `.vibezzz/deploy.yaml` schema
 
 ```yaml
-# Dev server (local testing, not containerized)
-dev_port: 3001
-dev_start_command: "bun run dev"
-dev_pid: null              # PID of running dev server; null when stopped
+preview:
+  command: "bun run dev -- --host 0.0.0.0 --port 3001"
+  port: 3001
+  healthcheck_path: /
+  pid: null
+  process_started_at: null
+  status: stopped          # stopped | starting | ready | failed
+  subdomain: music-queue-preview
+  url: null                # https://music-queue-preview.<DOMAIN>
+  public: true
+  last_ready_at: null
 
-# Published container deployment
-subdomain: my-app          # defaults to project name; <subdomain>.<DOMAIN>
-state: lazy                # up | down | lazy
-image: null                # Docker/Podman image name:tag
-container_name: null       # derived from subdomain (e.g. "vibebox-my-app")
-container_id: null         # running container ID; null when stopped
-container_port: 3001       # port the container exposes
-idle_timeout: 300          # seconds of inactivity before lazy container sleeps
-last_request_at: null      # ISO timestamp; used for idle detection
-caddy_route_id: null       # Caddy route array index, stored for targeted DELETE
+publish:
+  state: down              # down | up | lazy
+  subdomain: music-queue
+  url: null                # https://music-queue.<DOMAIN>
+  image: null
+  container_name: vibebox-music-queue
+  container_id: null
+  container_port: 3001
+  idle_timeout: 300
+  last_request_at: null
+  caddy_route_id: vibebox-music-queue
+
+automation:
+  auto_start_agent: true
+  auto_start_preview: true
+  auto_notify_on_ready: true
+  auto_publish: false
 ```
 
-**Startup reconciliation:** On vibebox startup, scan all `deploy.yaml` files. For any project with a non-null `container_id`, verify the container is actually running (`docker inspect`). If not, set `container_id: null`. For dev servers, clear stale `dev_pid` values similarly.
+`preview` is the fast feedback surface. `publish` is the durable shareable surface.
+
+**Startup reconciliation:** on vibebox startup:
+
+- clear stale preview process metadata if the process is gone or mismatched
+- clear stale container metadata if `inspect` says the container no longer exists
+- re-register any expected Caddy routes for previews or published projects that should be reachable
 
 ---
 
 ## AI Provider Abstraction
 
-A pluggable `AIProvider` interface. Both CLIs are already authenticated on the host machine — no API keys needed.
+The provider abstraction must model a real long-running coding process, not a single request/response call.
+
+Both CLIs are already authenticated on the host machine. vibebox never needs to store API keys itself.
 
 ```typescript
+interface AgentRunHandle {
+  pid: number
+  startedAt: string
+  stdout: ReadableStream<Uint8Array>
+  stderr: ReadableStream<Uint8Array>
+  stop(): Promise<void>
+  wait(): Promise<{
+    exitCode: number
+    finishedAt: string
+    commitSha?: string
+    result: 'ready_for_test' | 'building' | 'blocked' | 'failed'
+  }>
+}
+
 interface AIProvider {
   name: string
-  run(prompt: string, cwd?: string): Promise<string>
+  startRun(input: {
+    prompt: string
+    cwd: string
+    kind: 'bootstrap' | 'implement' | 'refine' | 'custom'
+  }): Promise<AgentRunHandle>
 }
 ```
 
-Implementations:
-- `ClaudeProvider` — spawns `claude --print "<prompt>"` — prompt passed as a separate argument to `Bun.spawn()`, never interpolated into a shell string (prevents injection)
-- `CopilotProvider` — spawns `copilot "<prompt>"` — same safe spawn approach
+### Provider behavior
 
-Provider is selectable per-action in the UI. Adding a new provider = one new class. Default set by `DEFAULT_PROVIDER` env var.
+- Providers must use agent-capable CLI modes, not one-shot `--print` style output.
+- Prompt text must always be passed as a separate subprocess argument or via stdin, never interpolated into a shell command string.
+- vibebox captures stdout/stderr into `.vibezzz/logs/<agent-id>.log` while also exposing live tail output in the UI.
+- Default provider comes from `DEFAULT_PROVIDER`.
+- The UI may allow per-run provider selection, but the common path should default intelligently rather than forcing extra clicks.
 
 ---
 
@@ -140,173 +260,254 @@ Provider is selectable per-action in the UI. Adding a new provider = one new cla
 
 ### `/` — Global Inbox
 
-- Textarea + submit button to add a new idea
-- List of all ideas sorted by `created_at` descending
-- Each idea card: content, timestamp, status badge
-- "Promote to Project" button on raw ideas
-- Promoted ideas shown muted with project link, not removed
+- Textarea + submit button for quick idea capture
+- Mobile-friendly list of ideas, newest first
+- Status badge on each idea
+- `Promote to Project` action on raw ideas
+- Shortcut/capture helper showing a simple API endpoint for phone automation
+- Recently promoted ideas remain visible with a link to the project
 
 ### `/synthesis`
 
-- Provider selector (Claude / Copilot)
-- "Synthesize" button — on-demand AI synthesis of all raw ideas
-- Output: AI-generated ranked summary, not persisted — regenerate any time
-
-**Synthesis prompt template:**
-```
-You are a creative project advisor. Below is a list of raw ideas.
-Rank them from most to least promising based on originality, feasibility, and impact.
-For each idea, provide a one-sentence rationale.
-Return the result as a numbered ranked list.
-
-Ideas:
-<idea list, one per line>
-```
+- Optional provider selector
+- `Synthesize` button for ranked summaries of raw ideas
+- Output is ephemeral and not persisted
+- Useful for triage, but not part of the core async-builder loop
 
 ### `/projects`
 
 - Collapsible category sections derived from `meta.yaml`
-- "Resync" button — rescans `PROJECTS_DIR`
-- Each project card: name, origin badge (brain/external), idea count, agent status dot (green if any agent running), deploy state badge (`UP` / `LAZY` / `DOWN`) if `deploy.yaml` exists
-- Move button per project: select/type new category
-- Click → `/projects/[...path]`
+- `Resync` button to scan `PROJECTS_DIR`
+- Each project card shows:
+  - project name
+  - origin badge
+  - project stage badge
+  - agent activity badge
+  - preview status badge
+  - publish status badge
+  - preview and public URLs when available
+- Move action per project
+- Click through to `/projects/[...path]`
 
 ### `/projects/[...path]` — Project Detail
 
 Three tabs:
 
 **Ideas tab**
-- Add idea form → writes to `.vibezzz/ideas.yaml`
-- List of ideas with status badges
-- "Mark Implemented" button → creates git tag + updates `ideas.yaml`
-- "Run Agent" button per idea → opens agent launcher with idea pre-filled
+- Add project-scoped idea
+- See idea history
+- `Run Agent` from a selected idea
+- `Mark Implemented` once a specific idea is shipped
 
-**Agents tab**
-- Running agents listed first (with elapsed time, stop button)
-- Agent history below (provider, summary, duration, status)
-- "Start Agent" button: provider selector + freeform prompt input → spawns CLI process
+**Runs tab**
+- Running agent at the top with elapsed time, provider, stop button
+- Live log stream for the active run
+- History list below with summary, status, result, branch, commit SHA, and link to stored log
+- `Start Run` form with provider + prompt
+- `Promote to Preview` action when a run reports `ready_for_test`
 
-**Deploy tab**
+**Access tab**
 
-*Dev server section:*
-- Port + start command inputs → saved to `deploy.yaml`
-- Start/Stop dev server button → spawns/kills process locally (no container)
-- Accessible on Tailscale only (not public)
+*Preview section*
+- Preview command + port inputs saved to `deploy.yaml`
+- Start/Stop preview process
+- Preview healthcheck status
+- Preview URL if public preview is enabled
+- `Restart Preview` and `Open Preview` buttons
 
-*Published deployment section:*
-- Docker/Podman image input (e.g. `my-app:latest`)
-- Subdomain input (defaults to project name)
-- Idle timeout input (default 300s)
-- State selector: **up / down / lazy** (lazy is default)
-  - `up` — container always running, always routed
-  - `down` — container stopped, subdomain not routed
-  - `lazy` — container sleeps until a request arrives, wakes up, sleeps again after idle timeout
-- "Publish" / "Unpublish" button applies the selected state
-- Live URL: `https://<subdomain>.<DOMAIN>` shown when state is `up` or `lazy`
+*Publish section*
+- Image input
+- Subdomain input
+- State selector: `up | down | lazy`
+- `Publish` / `Unpublish` button
+- Stable public URL when published
+- Explicit note that publish is for keeping/sharing something beyond the temporary preview
 
-### `/monitor` — Global Agent Monitor
+### `/monitor` — Global Monitor
 
 - All currently running agents across all projects
-- Each row: project name (link), provider badge, summary, elapsed time, stop button
-- Recent agent history (last 20 runs across all projects)
+- Active preview processes
+- Recent completed runs
+- Recent notification events
+- Quick links to projects that became ready
+
+---
+
+## API / Automation Surfaces
+
+These are first-class because the product is meant to be usable away from the desk.
+
+### `POST /api/ideas`
+
+Minimal endpoint for quick capture from phone shortcuts, shell aliases, or automations.
+
+```json
+{
+  "content": "voice memo transcription or typed idea"
+}
+```
+
+It appends a new raw idea to the global `ideas.yaml`.
+
+### `POST /api/projects/:path/runs`
+
+Starts an agent run for a project using the chosen provider and prompt.
+
+### `POST /api/projects/:path/preview/start`
+
+Starts or restarts the preview process, waits for readiness, and updates `deploy.yaml`.
+
+### `POST /api/projects/:path/publish`
+
+Applies the selected publish state (`up`, `down`, `lazy`) using the configured container runtime and Caddy route management.
 
 ---
 
 ## Key Flows
 
+### Capture Idea
+
+1. User submits an idea from the UI or `POST /api/ideas`
+2. Server appends it to global `ideas.yaml` with `status: raw`
+3. Idea appears immediately in the inbox
+
 ### Promote Idea to Project
 
-1. User clicks "Promote", enters project name and category
+1. User clicks `Promote`, chooses project name, category, and optional starter template
 2. Server creates `$PROJECTS_DIR/<category>/<name>/`
 3. Server runs `git init`
-4. Server writes `.vibezzz/meta.yaml`, empty `.vibezzz/ideas.yaml`, empty `.vibezzz/agents.yaml`
-5. Server spawns chosen CLI with scrum agent prompt + idea content in the new project directory; records agent run in `.vibezzz/agents.yaml`
-6. Server updates global `ideas.yaml`: `status: promoted`, `project_path: <category>/<name>`
-7. UI navigates to `/projects/<category>/<name>`
+4. Server writes:
+   - `.vibezzz/meta.yaml`
+   - empty `.vibezzz/ideas.yaml`
+   - empty `.vibezzz/agents.yaml`
+   - starter `.vibezzz/deploy.yaml`
+5. Server updates global `ideas.yaml` to `status: promoted`, with `project_path`
+6. If `automation.auto_start_agent` is true, server starts a bootstrap/implementation agent immediately
+7. UI navigates to the new project page
+
+### Start Agent Run
+
+1. User starts a run manually, or a promotion triggers one automatically
+2. vibebox invokes the provider in the project directory
+3. vibebox appends a `running` entry to `.vibezzz/agents.yaml`
+4. vibebox streams stdout/stderr to:
+   - `.vibezzz/logs/<agent-id>.log`
+   - the live Runs tab
+5. On exit, vibebox records:
+   - `status`
+   - `finished_at`
+   - `exit_code`
+   - `commit_sha` if available
+   - high-level `result`
+
+### Preview Ready
+
+1. A run finishes with `result: ready_for_test`, or the user starts preview manually
+2. If `automation.auto_start_preview` is true, vibebox starts the configured preview command
+3. vibebox waits for the preview healthcheck to pass
+4. vibebox updates:
+   - `preview.status: ready`
+   - `preview.url`
+   - `meta.project_stage: preview_ready`
+   - `meta.last_ready_at`
+5. If `automation.auto_notify_on_ready` is true, vibebox sends a notification containing the project name and preview URL
+
+### Publish Project
+
+**State: `up`**
+1. Ensure the project has an image configured
+2. Start container with the configured runtime
+3. Register a stable Caddy route for `<subdomain>.<DOMAIN>`
+4. Update `publish.state: up`, `container_id`, and `url`
+5. Set `meta.project_stage: published`
+
+**State: `lazy`**
+1. Register a stable wake route in Caddy pointing back to vibebox
+2. Keep the container stopped until the first request
+3. On first request:
+   - start container
+   - wait for readiness
+   - proxy through
+   - update `last_request_at`
+4. Background cleanup stops idle containers after `idle_timeout`
+
+**State: `down`**
+1. Stop container if running
+2. Remove public route
+3. Clear `container_id`
+4. Leave preview flow untouched
 
 ### Resync Project Tree
 
-1. User clicks "Resync"
-2. Server walks `PROJECTS_DIR` recursively, finds all directories containing `.git/`
-3. For each found project: read `.vibezzz/meta.yaml` if present, else create it with `origin: external`, category inferred from path
-4. Projects previously known but no longer on disk are flagged `missing` in the UI — transient UI-only state, not written to disk
-5. UI refreshes tree
-
-### Move Project
-
-1. User selects new category
-2. Server renames `$PROJECTS_DIR/<old>/<name>/` → `$PROJECTS_DIR/<new>/<name>/`
-3. Server updates `category` in `.vibezzz/meta.yaml`
-4. UI refreshes
+1. User clicks `Resync`
+2. Server scans `PROJECTS_DIR` for git repositories
+3. Missing `.vibezzz/meta.yaml` files are created with `origin: external`
+4. UI refreshes the project tree
 
 ### Mark Idea as Implemented
 
-1. User clicks "Mark Implemented"
-2. Server runs `git tag idea/<id>-<slug>` in project dir. **Known limitation:** requires at least one commit — UI shows a warning if repo has no commits yet.
-3. Server updates `.vibezzz/ideas.yaml`: `status: implemented`, `implemented_at`, `git_tag`
+1. User clicks `Mark Implemented`
+2. Server creates git tag `idea/<id>-<slug>` if the repo already has a commit
+3. Server updates `.vibezzz/ideas.yaml` with `status: implemented`, `implemented_at`, and `git_tag`
 
-### Start Agent
+### Notify User
 
-1. User selects provider + enters prompt (or promotes an idea)
-2. Server spawns `claude --print "<prompt>"` or `copilot "<prompt>"` via `Bun.spawn()` in the project directory
-3. Server appends entry to `.vibezzz/agents.yaml` with `status: running`, records PID in memory
-4. On process exit: server updates `agents.yaml` entry with `status: done|failed`, `finished_at`
-5. UI polls `/api/projects/[path]/agents` for live status
-
-### Publish Project (container deployment)
-
-**State: `up`**
-1. Server runs `docker run -d --name <container_name> -p <container_port> <image>`
-2. Stores `container_id` in `deploy.yaml`
-3. Adds Caddy route: `<subdomain>.<DOMAIN>` → `localhost:<container_port>`; stores `caddy_route_id`
-4. Sets `state: up`
-
-**State: `lazy`**
-1. Server adds Caddy route pointing to vibebox's own wake proxy: `<subdomain>.<DOMAIN>` → `localhost:<PORT>/wake/<subdomain>`; stores `caddy_route_id`
-2. Sets `state: lazy`, container not yet started
-3. On first incoming request to `/wake/<subdomain>`:
-   - Server starts container (`docker run ...`), waits for readiness
-   - Proxies the original request to `localhost:<container_port>`
-   - Updates `last_request_at`, `container_id`
-4. Subsequent requests to `/wake/<subdomain>` are proxied directly (container already running)
-5. Background job runs every 60s: for all lazy projects, if `now - last_request_at > idle_timeout`, stop container and clear `container_id`
-
-**State: `down`**
-1. If container running: `docker stop <container_name>`
-2. If Caddy route exists: DELETE from Caddy admin API
-3. Sets `state: down`, clears `container_id`, `caddy_route_id`
-
-### Unpublish Project
-
-1. Stop container if running
-2. DELETE Caddy route using stored `caddy_route_id`
-3. Clear `container_id`, `caddy_route_id`, set `state: down`
+1. vibebox generates a short event payload when:
+   - a preview becomes ready
+   - a publish succeeds
+   - a run fails after automatic promotion/bootstrap
+2. vibebox POSTs to the configured webhook
+3. Event includes project name, summary text, and URL when available
 
 ---
 
-## Caddy Setup (one-time)
+## Caddy + Cloudflare Setup
 
-Caddy is configured once. vibebox manages routes dynamically at runtime via Caddy's admin API — no `nixos-rebuild switch` per project.
+vibebox always uses Caddy as the local router. Cloudflare is the ingress layer in front of it.
 
-**Required Caddy config:**
-- Admin API enabled on `localhost:2019`
-- Wildcard TLS certificate for `*.<DOMAIN>` via ACME DNS challenge (Cloudflare API token)
-- Static vhost for vibebox itself: `vibebox.<DOMAIN> → localhost:3000`
+Two supported exposure modes:
 
-**Cloudflare DNS (one-time):**
-- `*.yourdomain.com → <server IP>` (wildcard A record)
-- `vibebox.yourdomain.com → <server IP>` (covered by wildcard)
+### Mode: `direct`
+
+- wildcard DNS points at the server IP
+- Caddy terminates TLS directly
+- vibebox manages routes through the Caddy admin API
+
+### Mode: `tunnel`
+
+- `cloudflared` exposes `*.DOMAIN` and `vibebox.DOMAIN`
+- Cloudflare forwards traffic to local Caddy
+- Caddy still does host-based routing to previews and published apps
+
+This keeps the app compatible with the user's current Cloudflare tunnel setup while preserving a simple internal routing model.
+
+### Required Caddy capabilities
+
+- admin API enabled on localhost
+- deterministic route IDs, not array-index deletes
+- static route for `vibebox.<DOMAIN>`
+- dynamic routes for:
+  - preview subdomains
+  - published project subdomains
+  - lazy wake handlers
+
+---
 
 ## Container Runtime
 
-Projects are deployed as containers. vibebox calls the container CLI directly — no Docker daemon SDK dependency.
+Published apps use a container runtime controlled by `CONTAINER_RUNTIME`.
 
-- Default: `docker` CLI
-- Alternative: `podman` (same CLI interface, daemonless, preferred on NixOS)
-- Configured via `CONTAINER_RUNTIME` env var
-- vibebox calls: `$CONTAINER_RUNTIME run|stop|inspect|rm ...`
+- default: `docker`
+- alternative: `podman`
+- vibebox shells out to the runtime CLI rather than depending on a daemon SDK
 
-**Image requirement:** each project must have a `Dockerfile` (or pre-built image tag) to be publishable. vibebox does not build images — the user provides the image name in the Deploy tab.
+**Important distinction:**
+
+- vibebox **does** manage running/stopping published containers
+- vibebox does **not** need to build images automatically for MVP
+- however, the product should make previews easy even before a container image exists
+
+That means previews can be process-based, while stable publish remains image-based.
 
 ---
 
@@ -324,38 +525,75 @@ Restart=on-failure
 
 ### `.env`
 
-```
+```text
 PORT=3000
-BIND_HOST=100.x.x.x          # Tailscale IP; use 0.0.0.0 for local dev
+BIND_HOST=100.x.x.x
 PROJECTS_DIR=/home/user/projects
 VIBEZZZ_REPO=/home/user/projects/vibezzz
-DEFAULT_PROVIDER=claude        # claude | copilot
+DEFAULT_PROVIDER=claude
 DOMAIN=yourdomain.com
 CADDY_ADMIN_URL=http://localhost:2019
-CONTAINER_RUNTIME=docker       # docker | podman
-LAZY_IDLE_TIMEOUT=300          # default idle timeout in seconds for lazy containers
+CONTAINER_RUNTIME=docker
+EXPOSE_MODE=tunnel                # tunnel | direct
+LAZY_IDLE_TIMEOUT=300
+NOTIFY_WEBHOOK_URL=
+NOTIFY_WEBHOOK_BEARER_TOKEN=
 ```
+
+### Notification behavior
+
+If `NOTIFY_WEBHOOK_URL` is set, vibebox sends JSON POST requests for important events. No provider-specific integration is required in the core app.
 
 ### NixOS
 
-Not NixOS-specific. The `systemd` service maps directly to `systemd.services` in NixOS config. A thin NixOS module wrapping the env vars and service definition can be added later.
+Still not NixOS-specific. A thin module can wrap the env vars and service definition later.
+
+---
+
+## Operational Safety
+
+This is a personal tool, so safety should be pragmatic rather than heavy-handed.
+
+Keep:
+
+- Tailscale-only access for vibebox UI
+- no custom auth system
+- plain YAML state
+- direct CLI use for providers and container runtime
+
+Add:
+
+- atomic YAML writes
+- deterministic Caddy route IDs
+- preview/container reconciliation on startup
+- no shell interpolation for prompts or project paths
+- sensible container defaults when publishing
+
+Non-goals for now:
+
+- hard multi-tenant isolation
+- sandboxed browser terminals
+- enterprise secrets management
 
 ---
 
 ## Non-Functional Requirements
 
-- **Mobile-friendly:** all views usable on a phone browser over Tailscale
-- **No auth:** Tailscale provides access control; no login system
-- **Agent-readable:** all state files are plain YAML
-- **Portable:** runs anywhere Bun runs; no NixOS-specific dependencies
+- **Mobile-friendly:** all major flows usable on a phone browser over Tailscale
+- **Single-user:** optimized for one person and their projects
+- **Agent-readable:** all durable state lives in plain YAML and git
+- **Observable:** active runs must expose live logs and durable log files
+- **Portable:** runs anywhere Bun runs
+- **Restart-safe:** stale process/container/route metadata is reconciled on startup
+- **Fun-first:** the default workflow minimizes clicks and prioritizes fast feedback
 
 ---
 
 ## Out of Scope
 
-- Authentication / login system
-- Real-time filesystem watching (use Resync instead)
-- Synthesis result persistence
-- Multi-user support
-- Notifications / alerts
-- SSH terminal in the browser
+- Authentication/login system beyond Tailscale
+- Multi-user collaboration
+- Real-time filesystem watching
+- Persistent synthesis history
+- Browser SSH terminal
+- Automatic image build pipelines beyond simple future hooks
