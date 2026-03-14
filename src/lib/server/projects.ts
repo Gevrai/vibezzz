@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readYaml, writeYaml } from './yaml';
 import { getConfig } from './config';
-import { updateIdea, getIdea } from './ideas';
+import { claimIdeaForPromotion } from './ideas';
 
 const execFileAsync = promisify(execFile);
 
@@ -225,15 +225,6 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 		throw new Error('Invalid project path');
 	}
 
-	const idea = await getIdea(opts.ideaId);
-
-	if (!idea) {
-		throw new Error(`Idea #${opts.ideaId} not found`);
-	}
-	if (idea.status !== 'raw') {
-		throw new Error(`Idea #${opts.ideaId} is already ${idea.status}`);
-	}
-
 	const vibezzzDir = join(projectDir, '.vibezzz');
 	const relPath = join(opts.category, opts.name);
 
@@ -241,6 +232,10 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 	if (await isDirectory(projectDir)) {
 		throw new Error(`Project directory already exists: ${relPath}`);
 	}
+
+	// Atomically claim the idea — prevents concurrent promotes from
+	// double-promoting the same idea into different projects.
+	await claimIdeaForPromotion(opts.ideaId, relPath);
 
 	// Initialize git
 	try {
@@ -303,12 +298,6 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 		}
 	};
 	await writeYaml(join(vibezzzDir, 'deploy.yaml'), deploy);
-
-	// Update the global idea to promoted
-	await updateIdea(opts.ideaId, {
-		status: 'promoted',
-		project_path: relPath
-	});
 
 	return { path: relPath, meta, signals: { ...DEFAULT_SIGNALS, preview_status: 'stopped', publish_state: 'down' } };
 }

@@ -1,5 +1,5 @@
 import type { PageServerLoad } from './$types';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { readYaml } from '$lib/server/yaml';
 import { getConfig } from '$lib/server/config';
 import { error } from '@sveltejs/kit';
@@ -19,6 +19,13 @@ export const load: PageServerLoad = async ({ params }) => {
 	const projectPath = params.path;
 	const { projectsDir } = getConfig();
 	const absPath = join(projectsDir, projectPath);
+
+	// Prevent path traversal outside the projects directory
+	const resolvedPath = resolve(absPath);
+	if (!resolvedPath.startsWith(resolve(projectsDir) + '/')) {
+		throw error(400, 'Invalid project path');
+	}
+
 	const vibezzzDir = join(absPath, '.vibezzz');
 	const metaPath = join(vibezzzDir, 'meta.yaml');
 
