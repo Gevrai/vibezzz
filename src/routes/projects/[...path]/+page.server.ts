@@ -4,35 +4,33 @@ import { readYaml } from '$lib/server/yaml';
 import { getConfig } from '$lib/server/config';
 import { error } from '@sveltejs/kit';
 import type { ProjectMeta, ProjectSignals, DeployPreview, DeployPublish, AgentEntry } from '$lib/server/projects';
-import { access } from 'node:fs/promises';
-
-async function exists(path: string): Promise<boolean> {
-	try {
-		await access(path);
-		return true;
-	} catch {
-		return false;
-	}
-}
+import { realpath } from 'node:fs/promises';
 
 export const load: PageServerLoad = async ({ params }) => {
 	const projectPath = params.path;
 	const { projectsDir } = getConfig();
 	const absPath = join(projectsDir, projectPath);
 
-	// Prevent path traversal outside the projects directory
-	const resolvedPath = resolve(absPath);
-	if (!resolvedPath.startsWith(resolve(projectsDir) + '/')) {
+	// Prevent path traversal outside the projects directory (symlink-safe)
+	let resolvedPath: string;
+	try {
+		resolvedPath = await realpath(absPath);
+	} catch {
+		// If the path doesn't exist at all, it's a 404 anyway
+		throw error(404, `Project not found: ${projectPath}`);
+	}
+	let resolvedRoot: string;
+	try {
+		resolvedRoot = await realpath(projectsDir);
+	} catch {
+		resolvedRoot = resolve(projectsDir);
+	}
+	if (!resolvedPath.startsWith(resolvedRoot + '/')) {
 		throw error(400, 'Invalid project path');
 	}
 
 	const vibezzzDir = join(absPath, '.vibezzz');
 	const metaPath = join(vibezzzDir, 'meta.yaml');
-
-	// Check the project directory itself exists (handles external repos too)
-	if (!await exists(absPath)) {
-		throw error(404, `Project not found: ${projectPath}`);
-	}
 
 	let meta = await readYaml<ProjectMeta | null>(metaPath, null);
 

@@ -100,6 +100,22 @@ export async function claimIdeaForPromotion(id: number, projectPath: string): Pr
 	});
 }
 
+/**
+ * Rolls back a claimed idea to 'raw' when project bootstrap fails after
+ * claimIdeaForPromotion succeeded. Only resets ideas that are still 'promoted'.
+ */
+export async function unclaimIdea(id: number): Promise<void> {
+	return withIdeasLock(async () => {
+		const ideas = await readYaml<Idea[]>(globalIdeasPath(), []);
+		const idx = ideas.findIndex((i) => i.id === id);
+		if (idx === -1) return;
+		if (ideas[idx].status !== 'promoted') return;
+		ideas[idx].status = 'raw';
+		ideas[idx].project_path = null;
+		await writeYaml(globalIdeasPath(), ideas);
+	});
+}
+
 export async function getIdea(id: number): Promise<Idea | undefined> {
 	const ideas = await listIdeas();
 	return ideas.find((i) => i.id === id);

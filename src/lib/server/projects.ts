@@ -1,10 +1,10 @@
 import { join, relative, resolve } from 'node:path';
-import { readdir, stat, access } from 'node:fs/promises';
+import { readdir, stat, access, realpath, rm } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readYaml, writeYaml } from './yaml';
 import { getConfig } from './config';
-import { claimIdeaForPromotion } from './ideas';
+import { claimIdeaForPromotion, unclaimIdea } from './ideas';
 
 const execFileAsync = promisify(execFile);
 
@@ -79,6 +79,38 @@ async function isDirectory(path: string): Promise<boolean> {
 		return s.isDirectory();
 	} catch {
 		return false;
+	}
+}
+
+/**
+ * Resolve symlinks and verify the real path stays inside the projects root.
+ * Falls back to lexical `resolve()` when the path doesn't exist yet (e.g.
+ * during promotion before `git init` creates the directory).
+ */
+async function assertInsideProjectsDir(targetPath: string, projectsDir: string): Promise<void> {
+	let resolvedTarget: string;
+	let resolvedRoot: string;
+	try {
+		// Resolve symlinks for the deepest existing ancestor
+		resolvedTarget = await realpath(targetPath);
+	} catch {
+		// Path doesn't exist yet — resolve its parent to catch symlinked parents
+		const parent = resolve(targetPath, '..');
+		try {
+			const realParent = await realpath(parent);
+			resolvedTarget = join(realParent, targetPath.split('/').pop()!);
+		} catch {
+			// Neither target nor parent exist; fall back to lexical resolve
+			resolvedTarget = resolve(targetPath);
+		}
+	}
+	try {
+		resolvedRoot = await realpath(projectsDir);
+	} catch {
+		resolvedRoot = resolve(projectsDir);
+	}
+	if (!resolvedTarget.startsWith(resolvedRoot + '/')) {
+		throw new Error('Invalid project path');
 	}
 }
 
@@ -219,11 +251,8 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 
 	const projectDir = join(projectsDir, opts.category, opts.name);
 
-	// Ensure the resolved path stays inside PROJECTS_DIR
-	const resolved = resolve(projectDir);
-	if (!resolved.startsWith(resolve(projectsDir) + '/')) {
-		throw new Error('Invalid project path');
-	}
+	// Ensure the resolved path stays inside PROJECTS_DIR (symlink-safe)
+	await assertInsideProjectsDir(projectDir, projectsDir);
 
 	const vibezzzDir = join(projectDir, '.vibezzz');
 	const relPath = join(opts.category, opts.name);
@@ -237,67 +266,76 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 	// double-promoting the same idea into different projects.
 	await claimIdeaForPromotion(opts.ideaId, relPath);
 
-	// Initialize git
+	// Bootstrap the project directory. If any step fails, roll back the
+	// idea claim so it returns to 'raw' and isn't stranded as 'promoted'.
 	try {
-		await execFileAsync('git', ['init', projectDir]);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : 'git init failed';
-		throw new Error(`git init failed: ${message}`);
-	}
-
-	// Create meta.yaml
-	const meta: ProjectMeta = {
-		name: opts.name,
-		category: opts.category,
-		origin: 'brain',
-		created_at: new Date().toISOString(),
-		idea_id: opts.ideaId,
-		template: opts.template || null,
-		project_stage: 'bootstrapping',
-		last_ready_at: null
-	};
-	await writeYaml(join(vibezzzDir, 'meta.yaml'), meta);
-
-	// Create empty ideas.yaml
-	await writeYaml(join(vibezzzDir, 'ideas.yaml'), []);
-
-	// Create empty agents.yaml
-	await writeYaml(join(vibezzzDir, 'agents.yaml'), []);
-
-	// Create starter deploy.yaml
-	const deploy = {
-		preview: {
-			command: '',
-			port: 3001,
-			healthcheck_path: '/',
-			pid: null,
-			process_started_at: null,
-			status: 'stopped',
-			subdomain: `${opts.name}-preview`,
-			url: null,
-			public: true,
-			last_ready_at: null
-		},
-		publish: {
-			state: 'down',
-			subdomain: opts.name,
-			url: null,
-			image: null,
-			container_name: `vibebox-${opts.name}`,
-			container_id: null,
-			container_port: 3001,
-			idle_timeout: 300,
-			last_request_at: null,
-			caddy_route_id: `vibebox-${opts.name}`
-		},
-		automation: {
-			auto_start_agent: true,
-			auto_start_preview: true,
-			auto_notify_on_ready: true,
-			auto_publish: false
+		// Initialize git
+		try {
+			await execFileAsync('git', ['init', projectDir]);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : 'git init failed';
+			throw new Error(`git init failed: ${message}`);
 		}
-	};
-	await writeYaml(join(vibezzzDir, 'deploy.yaml'), deploy);
 
-	return { path: relPath, meta, signals: { ...DEFAULT_SIGNALS, preview_status: 'stopped', publish_state: 'down' } };
+		// Create meta.yaml
+		const meta: ProjectMeta = {
+			name: opts.name,
+			category: opts.category,
+			origin: 'brain',
+			created_at: new Date().toISOString(),
+			idea_id: opts.ideaId,
+			template: opts.template || null,
+			project_stage: 'bootstrapping',
+			last_ready_at: null
+		};
+		await writeYaml(join(vibezzzDir, 'meta.yaml'), meta);
+
+		// Create empty ideas.yaml
+		await writeYaml(join(vibezzzDir, 'ideas.yaml'), []);
+
+		// Create empty agents.yaml
+		await writeYaml(join(vibezzzDir, 'agents.yaml'), []);
+
+		// Create starter deploy.yaml
+		const deploy = {
+			preview: {
+				command: '',
+				port: 3001,
+				healthcheck_path: '/',
+				pid: null,
+				process_started_at: null,
+				status: 'stopped',
+				subdomain: `${opts.name}-preview`,
+				url: null,
+				public: true,
+				last_ready_at: null
+			},
+			publish: {
+				state: 'down',
+				subdomain: opts.name,
+				url: null,
+				image: null,
+				container_name: `vibebox-${opts.name}`,
+				container_id: null,
+				container_port: 3001,
+				idle_timeout: 300,
+				last_request_at: null,
+				caddy_route_id: `vibebox-${opts.name}`
+			},
+			automation: {
+				auto_start_agent: true,
+				auto_start_preview: true,
+				auto_notify_on_ready: true,
+				auto_publish: false
+			}
+		};
+		await writeYaml(join(vibezzzDir, 'deploy.yaml'), deploy);
+
+		return { path: relPath, meta, signals: { ...DEFAULT_SIGNALS, preview_status: 'stopped', publish_state: 'down' } };
+	} catch (bootstrapErr) {
+		// Roll back: return idea to 'raw' and remove any partially created directory
+		await unclaimIdea(opts.ideaId).catch(() => {});
+		await rm(projectDir, { recursive: true, force: true }).catch(() => {});
+		throw bootstrapErr;
+	}
 }
