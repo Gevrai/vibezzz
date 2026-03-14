@@ -101,22 +101,32 @@ async function isRealDirectory(path: string): Promise<boolean> {
  * closing the TOCTOU window between validation and use.
  */
 async function assertInsideProjectsDir(targetPath: string, projectsDir: string): Promise<string> {
+	// Walk up from targetPath to find the deepest existing ancestor, then
+	// reconstruct the full path from its realpath.  This handles cases where
+	// PROJECTS_DIR itself is a symlink and the target (+ its parent) doesn't
+	// exist yet — e.g. during promotion into a new category.
 	let resolvedTarget: string;
-	let resolvedRoot: string;
-	try {
-		// Resolve symlinks for the deepest existing ancestor
-		resolvedTarget = await realpath(targetPath);
-	} catch {
-		// Path doesn't exist yet — resolve its parent to catch symlinked parents
-		const parent = resolve(targetPath, '..');
-		try {
-			const realParent = await realpath(parent);
-			resolvedTarget = join(realParent, targetPath.split('/').pop()!);
-		} catch {
-			// Neither target nor parent exist; fall back to lexical resolve
-			resolvedTarget = resolve(targetPath);
+	{
+		let current = targetPath;
+		const tail: string[] = [];
+		for (;;) {
+			try {
+				const real = await realpath(current);
+				resolvedTarget = tail.length > 0 ? join(real, ...tail) : real;
+				break;
+			} catch {
+				tail.unshift(current.split('/').pop()!);
+				const parent = resolve(current, '..');
+				if (parent === current) {
+					// Reached filesystem root without finding an existing path
+					resolvedTarget = resolve(targetPath);
+					break;
+				}
+				current = parent;
+			}
 		}
 	}
+	let resolvedRoot: string;
 	try {
 		resolvedRoot = await realpath(projectsDir);
 	} catch {
@@ -243,6 +253,15 @@ export async function scanProjects(): Promise<ScannedProject[]> {
 		return [];
 	}
 
+	// Canonicalize vibezzzRepo so the self-skip comparison works even when
+	// the env var contains a symlink or non-canonical path.
+	let resolvedVibezzzRepo: string;
+	try {
+		resolvedVibezzzRepo = await realpath(vibezzzRepo);
+	} catch {
+		resolvedVibezzzRepo = resolve(vibezzzRepo);
+	}
+
 	let categories: string[];
 	try {
 		categories = await readdir(resolvedProjectsDir);
@@ -286,7 +305,7 @@ export async function scanProjects(): Promise<ScannedProject[]> {
 			if (!await isGitRepo(realProjectPath)) continue;
 
 			// Skip the vibezzz repo itself
-			if (realProjectPath === vibezzzRepo) continue;
+			if (realProjectPath === resolvedVibezzzRepo) continue;
 
 			const realVibezzzDir = await verifyVibezzzDir(realProjectPath);
 			let meta: ProjectMeta | null = null;
