@@ -72,7 +72,7 @@ describe('config', () => {
 		}));
 
 		const { getConfig } = await import('../config.js');
-		expect(() => getConfig()).toThrow('Missing required environment variable: BIND_HOST');
+		expect(() => getConfig()).toThrow('Missing required environment variable(s):');
 	});
 
 	it('parses integer values', async () => {
@@ -97,7 +97,7 @@ describe('config', () => {
 		}));
 
 		const { getConfig } = await import('../config.js');
-		expect(() => getConfig()).toThrow('Environment variable PORT must be an integer');
+		expect(() => getConfig()).toThrow('PORT must be a valid integer (1–65535)');
 	});
 
 	it('throws for invalid DEFAULT_PROVIDER', async () => {

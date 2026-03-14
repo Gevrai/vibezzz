@@ -35,8 +35,8 @@ function optionalNullable(name: string): string | null {
 function intOr(name: string, fallback: number): number {
 	const raw = env[name];
 	if (!raw) return fallback;
-	const parsed = parseInt(raw, 10);
-	if (isNaN(parsed)) {
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed)) {
 		throw new Error(`Environment variable ${name} must be an integer, got: ${raw}`);
 	}
 	return parsed;

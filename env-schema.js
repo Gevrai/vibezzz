@@ -33,8 +33,8 @@ export function validateRequired(get) {
  */
 export function parsePort(raw, fallback = 3000) {
 	if (raw == null || raw === '') return fallback;
-	const parsed = parseInt(raw, 10);
-	if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
 		throw new Error(`PORT must be a valid integer (1–65535), got: ${raw}`);
 	}
 	return parsed;
