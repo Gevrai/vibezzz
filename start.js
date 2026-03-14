@@ -1,7 +1,9 @@
 // Production start wrapper for svelte-adapter-bun.
-// Maps the BIND_HOST env contract to the HOST var the adapter reads.
-if (process.env.BIND_HOST) {
-	process.env.HOST = process.env.BIND_HOST;
-}
+// Validates env via shared boot config, then maps BIND_HOST → HOST
+// for the adapter.
+import { loadBootConfig } from './boot-env.js';
+
+const boot = loadBootConfig();
+process.env.HOST = boot.host;
 
 await import('./build/index.js');
