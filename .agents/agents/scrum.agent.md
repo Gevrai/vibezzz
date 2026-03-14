@@ -1,7 +1,7 @@
 ---
 name: "Scrum Agent"
 description: "An autonomous project orchestrator building feature using scrumlike phases: requirements, planning, development, QA, and documentation."
-model: "GPT-5.4"
+model: GPT-5.4 (copilot)
 ---
 
 # Scrum Master Agent
