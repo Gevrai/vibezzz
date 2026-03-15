@@ -6,10 +6,13 @@ import { error } from '@sveltejs/kit';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import type { ProjectMeta, ProjectSignals, DeployPreview, DeployPublish, AgentEntry } from '$lib/server/projects';
 import { realpath } from 'node:fs/promises';
+import { getActiveRun, getRunHistory, type AgentRunEntry } from '$lib/server/agents';
+import { readDeployConfig, getActivePreview, checkPreviewHealth, type DeployConfig } from '$lib/server/preview';
+import { listProviders, type ProviderName } from '$lib/server/providers';
 
 export const load: PageServerLoad = async ({ params }) => {
 	const projectPath = params.path;
-	const { projectsDir } = getConfig();
+	const { projectsDir, defaultProvider } = getConfig();
 	const absPath = join(projectsDir, projectPath);
 
 	// Prevent path traversal outside the projects directory (symlink-safe)
@@ -17,7 +20,6 @@ export const load: PageServerLoad = async ({ params }) => {
 	try {
 		resolvedPath = await realpath(absPath);
 	} catch {
-		// If the path doesn't exist at all, it's a 404 anyway
 		throw error(404, `Project not found: ${projectPath}`);
 	}
 	let resolvedRoot: string;
@@ -30,7 +32,6 @@ export const load: PageServerLoad = async ({ params }) => {
 		throw error(400, 'Invalid project path');
 	}
 
-	// Verify .vibezzz is a real directory (not a symlink) before reading through it
 	const vibezzzDir = await verifyVibezzzDir(resolvedPath);
 
 	let meta: ProjectMeta | null = null;
@@ -38,7 +39,6 @@ export const load: PageServerLoad = async ({ params }) => {
 		meta = await readYaml<ProjectMeta | null>(join(vibezzzDir, 'meta.yaml'), null);
 	}
 
-	// External repo without .vibezzz/meta.yaml — synthesize metadata
 	if (!meta) {
 		const segments = projectPath.split('/');
 		if (segments.length < 2) {
@@ -56,7 +56,7 @@ export const load: PageServerLoad = async ({ params }) => {
 		};
 	}
 
-	// Read signals
+	// Signals
 	const signals: ProjectSignals = {
 		preview_status: null,
 		preview_url: null,
@@ -66,12 +66,11 @@ export const load: PageServerLoad = async ({ params }) => {
 		last_agent_status: null
 	};
 
-	const deploy = vibezzzDir
-		? await readYaml<{ preview?: DeployPreview; publish?: DeployPublish } | null>(
-				join(vibezzzDir, 'deploy.yaml'),
-				null
-			)
-		: null;
+	// Deploy config
+	let deploy: DeployConfig | null = null;
+	if (vibezzzDir) {
+		deploy = await readDeployConfig(vibezzzDir);
+	}
 	if (deploy) {
 		if (deploy.preview) {
 			signals.preview_status = deploy.preview.status ?? null;
@@ -83,14 +82,61 @@ export const load: PageServerLoad = async ({ params }) => {
 		}
 	}
 
-	const agents = vibezzzDir
-		? await readYaml<AgentEntry[]>(join(vibezzzDir, 'agents.yaml'), [])
-		: [];
-	if (agents.length > 0) {
-		const last = agents[agents.length - 1];
+	// Agent runs
+	let runs: AgentRunEntry[] = [];
+	if (vibezzzDir) {
+		runs = await getRunHistory(vibezzzDir);
+	}
+	const activeRun = getActiveRun(projectPath);
+	if (runs.length > 0) {
+		const last = runs[runs.length - 1];
 		signals.last_agent_status = last.status ?? null;
 		signals.agent_active = last.status === 'running';
 	}
 
-	return { path: projectPath, meta, signals };
+	// Project-scoped ideas
+	interface ProjectIdea {
+		id: number;
+		content: string;
+		created_at: string;
+		status: string;
+		implemented_at: string | null;
+		git_tag: string | null;
+	}
+	let ideas: ProjectIdea[] = [];
+	if (vibezzzDir) {
+		ideas = await readYaml<ProjectIdea[]>(join(vibezzzDir, 'ideas.yaml'), []);
+	}
+
+	// Preview healthcheck
+	let previewHealthy = false;
+	if (deploy?.preview?.status === 'ready' && deploy.preview.port) {
+		previewHealthy = await checkPreviewHealth(
+			deploy.preview.port,
+			deploy.preview.healthcheck_path || '/'
+		);
+	}
+
+	const providers = listProviders();
+
+	return {
+		path: projectPath,
+		meta,
+		signals,
+		runs: runs.reverse(),
+		activeRun: activeRun
+			? {
+					id: activeRun.entry.id,
+					provider: activeRun.entry.provider,
+					summary: activeRun.entry.summary,
+					started_at: activeRun.entry.started_at,
+					status: activeRun.entry.status
+				}
+			: null,
+		ideas: ideas.reverse(),
+		deploy,
+		previewHealthy,
+		providers,
+		defaultProvider
+	};
 };
