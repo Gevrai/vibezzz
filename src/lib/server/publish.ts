@@ -30,7 +30,18 @@ import { getConfig } from './config.js';
 import { readYaml, writeYaml } from './yaml.js';
 import { notify } from './notifications.js';
 import { scanProjects } from './projects.js';
-import { withDeployLock } from './deploy-lock.js';
+import { withDeployLock, withSubdomainClaimLock } from './deploy-lock.js';
+
+/**
+ * Thrown when a subdomain is already claimed by another project.
+ * Endpoints should catch this and return a 400/409 response.
+ */
+export class SubdomainConflictError extends Error {
+	constructor(subdomain: string) {
+		super(`Subdomain '${subdomain}' is already claimed by another project`);
+		this.name = 'SubdomainConflictError';
+	}
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -287,7 +298,7 @@ export async function updatePublishSettings(
 	projectName: string,
 	settings: PublishSettings
 ): Promise<DeployConfig> {
-	return withDeployLock(vibezzzDir, async () => {
+	return withSubdomainClaimLock(() => withDeployLock(vibezzzDir, async () => {
 	const deploy = (await readDeployConfig(vibezzzDir)) ?? {
 		preview: {
 			command: '',
@@ -317,7 +328,7 @@ export async function updatePublishSettings(
 	if (settings.subdomain !== undefined && settings.subdomain !== deploy.publish.subdomain) {
 		// Reject if subdomain is already claimed by another project
 		if (await isSubdomainClaimedByOther(settings.subdomain, vibezzzDir)) {
-			throw new Error(`Subdomain '${settings.subdomain}' is already claimed by another project`);
+			throw new SubdomainConflictError(settings.subdomain);
 		}
 
 		const oldSubdomain = deploy.publish.subdomain;
@@ -453,11 +464,10 @@ export async function updatePublishSettings(
 	}
 
 	return deploy;
-	});
+	}));
 }
 
 /**
- * Apply a publish state transition (up, down, or lazy).
  */
 export async function applyPublishState(
 	vibezzzDir: string,
@@ -465,7 +475,7 @@ export async function applyPublishState(
 	projectName: string,
 	targetState: PublishState
 ): Promise<DeployConfig> {
-	return withDeployLock(vibezzzDir, async () => {
+	return withSubdomainClaimLock(() => withDeployLock(vibezzzDir, async () => {
 	const config = getConfig();
 
 	const deploy = (await readDeployConfig(vibezzzDir)) ?? {
@@ -497,7 +507,7 @@ export async function applyPublishState(
 			throw new Error('Cannot publish: no subdomain configured');
 		}
 		if (await isSubdomainClaimedByOther(pub.subdomain, vibezzzDir)) {
-			throw new Error(`Cannot publish: subdomain '${pub.subdomain}' is already claimed by another project`);
+			throw new SubdomainConflictError(pub.subdomain);
 		}
 
 		// Save lazy entry so we can restore it if the transition fails
@@ -564,7 +574,7 @@ export async function applyPublishState(
 			throw new Error('Cannot set lazy publish: no subdomain configured');
 		}
 		if (await isSubdomainClaimedByOther(pub.subdomain, vibezzzDir)) {
-			throw new Error(`Cannot set lazy publish: subdomain '${pub.subdomain}' is already claimed by another project`);
+			throw new SubdomainConflictError(pub.subdomain);
 		}
 
 		// Stop container if running (lazy starts on demand)
@@ -660,7 +670,7 @@ export async function applyPublishState(
 	}
 
 	return deploy;
-	});
+	}));
 }
 
 /**

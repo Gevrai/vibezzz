@@ -9,7 +9,7 @@ import { realpath } from 'node:fs/promises';
 import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { updateDeploySettings, readDeployConfig } from '$lib/server/preview';
-import { updatePublishSettings } from '$lib/server/publish';
+import { updatePublishSettings, SubdomainConflictError } from '$lib/server/publish';
 import { reconciliationReady } from '$lib/server/reconcile';
 
 export const GET: RequestHandler = async ({ params }) => {
@@ -77,10 +77,17 @@ export const POST: RequestHandler = async ({ params, request }) => {
 	if (body.publish_image !== undefined || body.publish_subdomain !== undefined) {
 		const segments = projectPath.split('/');
 		const projectName = segments[segments.length - 1] || projectPath;
-		config = await updatePublishSettings(vibezzzDir, projectName, {
-			image: body.publish_image,
-			subdomain: body.publish_subdomain
-		});
+		try {
+			config = await updatePublishSettings(vibezzzDir, projectName, {
+				image: body.publish_image,
+				subdomain: body.publish_subdomain
+			});
+		} catch (err) {
+			if (err instanceof SubdomainConflictError) {
+				throw error(409, err.message);
+			}
+			throw err;
+		}
 	}
 
 	return json(config);

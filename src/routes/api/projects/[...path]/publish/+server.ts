@@ -13,7 +13,7 @@ import { realpath } from 'node:fs/promises';
 import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { readDeployConfig } from '$lib/server/preview';
-import { applyPublishState, updatePublishSettings, type PublishState } from '$lib/server/publish';
+import { applyPublishState, updatePublishSettings, SubdomainConflictError, type PublishState } from '$lib/server/publish';
 import { reconciliationReady } from '$lib/server/reconcile';
 
 async function resolveProject(path: string) {
@@ -62,11 +62,18 @@ export const POST: RequestHandler = async ({ params, request }) => {
 
 	// Update settings first if provided
 	if (body.image !== undefined || body.subdomain !== undefined || body.container_port !== undefined) {
-		await updatePublishSettings(vibezzzDir, projectName, {
-			image: body.image,
-			subdomain: body.subdomain,
-			container_port: body.container_port ? parseInt(body.container_port, 10) : undefined
-		});
+		try {
+			await updatePublishSettings(vibezzzDir, projectName, {
+				image: body.image,
+				subdomain: body.subdomain,
+				container_port: body.container_port ? parseInt(body.container_port, 10) : undefined
+			});
+		} catch (err) {
+			if (err instanceof SubdomainConflictError) {
+				throw error(409, err.message);
+			}
+			throw err;
+		}
 	}
 
 	// Apply state change if requested
@@ -79,6 +86,9 @@ export const POST: RequestHandler = async ({ params, request }) => {
 			const config = await applyPublishState(vibezzzDir, projectPath, projectName, body.state);
 			return json(config);
 		} catch (err) {
+			if (err instanceof SubdomainConflictError) {
+				throw error(409, err.message);
+			}
 			const message = err instanceof Error ? err.message : 'Publish operation failed';
 			throw error(400, message);
 		}
