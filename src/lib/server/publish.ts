@@ -442,10 +442,11 @@ export async function updatePublishSettings(
 
 	// -- Live side-effects (only reached after successful persist) --
 
-	// Execute deferred container stop for subdomain change
+	// Execute deferred container stop for subdomain change.
+	// Port release is deferred until after old route removal below so
+	// a stale route never references a port given to another container.
 	if (containerToStop) {
 		await stopContainer(containerToStop);
-		releaseHostPort(portToRelease);
 	}
 
 	// Execute deferred container stop for image/port change on lazy entry
@@ -453,24 +454,27 @@ export async function updatePublishSettings(
 		const running = await containerIsRunning(existingLazyEntry.containerName);
 		if (running) {
 			await stopContainer(existingLazyEntry.containerName);
-			releaseHostPort(existingLazyEntry.hostPort);
-			existingLazyEntry.hostPort = null;
-
-			// Restore Caddy route to vibebox's wake endpoint so the
-			// hostname doesn't point at a dead upstream until the next
-			// lazy wake re-switches it.  This is mandatory — failure
-			// leaves the hostname dead with no automatic recovery path
-			// other than a full reconcile.
-			const config = getConfig();
-			const host = `${deploy.publish.subdomain}.${config.domain}`;
-			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
-			if (!routeOk) {
-				deploy.publish.needs_wake_route = true;
-				await writeDeployConfig(vibezzzDir, deploy);
-				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after image/port change — persisted for reconciliation`);
-				throw new Error(`Failed to restore wake route for ${host} after image/port change — hostname unreachable`);
-			}
 		}
+
+		// Restore Caddy route to vibebox's wake endpoint so the
+		// hostname doesn't point at a dead upstream until the next
+		// lazy wake re-switches it.  Mandatory even when the container
+		// is already down — the direct route may still be pinned to
+		// the old host port from a prior wake.
+		const config = getConfig();
+		const host = `${deploy.publish.subdomain}.${config.domain}`;
+		const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+		if (routeOk) {
+			releaseHostPort(existingLazyEntry.hostPort);
+		} else {
+			// Keep port tracked while the stale direct route still references it
+			trackHostPort(existingLazyEntry.hostPort);
+			deploy.publish.needs_wake_route = true;
+			await writeDeployConfig(vibezzzDir, deploy);
+			console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after image/port change — persisted for reconciliation`);
+			throw new Error(`Failed to restore wake route for ${host} after image/port change — hostname unreachable`);
+		}
+		existingLazyEntry.hostPort = null;
 	}
 
 	// Disable old lazy entry before removal so in-flight wakeAndProxy()
@@ -492,6 +496,8 @@ export async function updatePublishSettings(
 		const removed = await removeRoute(oldRouteToRemove);
 		if (!removed) {
 			oldRouteRemoved = false;
+			// Keep port tracked while the stale route still references it
+			trackHostPort(portToRelease);
 			// Persist the retired route ID so reconciliation can retry cleanup
 			if (!deploy.publish.retired_routes) deploy.publish.retired_routes = [];
 			if (!deploy.publish.retired_routes.includes(oldRouteToRemove)) {
@@ -499,6 +505,8 @@ export async function updatePublishSettings(
 			}
 			await writeDeployConfig(vibezzzDir, deploy);
 			console.warn(`[publish] Old route ${oldRouteToRemove} removal failed during rename; persisted for reconciliation cleanup`);
+		} else {
+			releaseHostPort(portToRelease);
 		}
 	}
 	if (oldSubdomainToDelete) {
@@ -824,11 +832,13 @@ export async function applyPublishState(
 		if (needsContainerStop) {
 			await stopContainer(pub.container_name);
 		}
-		releaseHostPort(priorHostPort);
 
-		// Live side-effects: Caddy route removal + lazy registry cleanup + meta
+		// Remove route BEFORE releasing the port so a stale route can
+		// never reference a port that another container may be given.
 		const routeOk = await removeRoute(pub.caddy_route_id);
 		if (!routeOk) {
+			// Keep port tracked while the stale route still references it
+			trackHostPort(priorHostPort);
 			// Persist the retired route ID so reconciliation can retry cleanup
 			if (!pub.retired_routes) pub.retired_routes = [];
 			if (!pub.retired_routes.includes(pub.caddy_route_id)) {
@@ -840,6 +850,7 @@ export async function applyPublishState(
 			// still intercepts requests — prevents fall-through to the
 			// main app while the stale Caddy route exists.
 		} else {
+			releaseHostPort(priorHostPort);
 			lazyRegistry.delete(pub.subdomain);
 		}
 
@@ -926,14 +937,19 @@ export async function reconcilePublish(
 	if (pub.state === 'up' && pub.container_id) {
 		const running = await containerIsRunning(pub.container_name);
 		if (!running) {
-			// Container is gone — mark as down
-			releaseHostPort(pub.host_port);
+			// Container is gone — mark as down.
+			// Defer port release until after route removal so a stale
+			// route never references a port given to another container.
+			const stalePort = pub.host_port;
 			pub.state = 'down';
 			pub.container_id = null;
 			pub.host_port = null;
 			pub.url = null;
 			const routeOk = await removeRoute(pub.caddy_route_id);
-			if (!routeOk) {
+			if (routeOk) {
+				releaseHostPort(stalePort);
+			} else {
+				trackHostPort(stalePort);
 				if (!pub.retired_routes) pub.retired_routes = [];
 				if (!pub.retired_routes.includes(pub.caddy_route_id)) {
 					pub.retired_routes.push(pub.caddy_route_id);
@@ -1270,18 +1286,20 @@ export async function checkIdleContainers(): Promise<void> {
 
 			// All checks passed — stop the container and clear metadata
 			await stopContainer(entry.containerName);
-			releaseHostPort(entry.hostPort);
-			entry.hostPort = null;
 
 			// Revert Caddy route back to vibebox's port for wake-on-demand.
-			// This is mandatory — without it the hostname has no upstream.
+			// Release the port only AFTER the route has been switched so a
+			// stale direct route never references a port given to another container.
 			const config = getConfig();
 			const host = `${subdomain}.${config.domain}`;
 			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
-			if (!routeOk) {
+			if (routeOk) {
+				releaseHostPort(entry.hostPort);
+			} else {
 				deploy.publish.needs_wake_route = true;
 				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after idle shutdown — persisted for reconciliation`);
 			}
+			entry.hostPort = null;
 
 			deploy.publish.container_id = null;
 			deploy.publish.host_port = null;
