@@ -83,7 +83,7 @@ interface LazyEntry {
 	idleTimeout: number;
 	lastRequestAt: number;
 	starting: boolean;
-	startPromise: Promise<boolean> | null;
+	startPromise: Promise<number | null> | null;
 	/** Set during unpublish to prevent in-flight wakes from reviving state. */
 	disabled: boolean;
 }
@@ -801,8 +801,7 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 
 	// Serialize concurrent start attempts
 	if (entry.startPromise) {
-		const ok = await entry.startPromise;
-		return ok ? entry.hostPort : null;
+		return await entry.startPromise;
 	}
 
 	entry.starting = true;
@@ -822,7 +821,7 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 			if (!containerId) {
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
-				return false;
+				return null;
 			}
 
 			// Wait for the container to be healthy
@@ -832,7 +831,7 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
-				return false;
+				return null;
 			}
 
 			// Check if entry was disabled during wake (e.g. unpublish started)
@@ -840,7 +839,7 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
-				return false;
+				return null;
 			}
 
 			// Persist container_id and host_port atomically via the deploy lock.
@@ -875,22 +874,21 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
-				return false;
+				return null;
 			}
 
 			console.log(`[publish] Lazy wake: started ${entry.containerName} for ${subdomain}`);
-			return true;
+			return hostPort;
 		} catch (err) {
 			console.error(`[publish] Lazy wake failed for ${entry.containerName}: ${(err as Error).message}`);
-			return false;
+			return null;
 		} finally {
 			entry.starting = false;
 			entry.startPromise = null;
 		}
 	})();
 
-	const ok = await entry.startPromise;
-	return ok ? entry.hostPort : null;
+	return await entry.startPromise;
 }
 
 async function persistLastRequest(entry: LazyEntry): Promise<void> {
