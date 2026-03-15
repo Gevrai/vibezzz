@@ -10,6 +10,7 @@ import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { readYaml } from '$lib/server/yaml';
 import { startRun } from '$lib/server/agents';
+import { reconciliationReady } from '$lib/server/reconcile';
 import type { ProviderName, RunKind } from '$lib/server/providers';
 
 interface ProjectIdea {
@@ -19,6 +20,7 @@ interface ProjectIdea {
 }
 
 export const POST: RequestHandler = async ({ params, request }) => {
+	await reconciliationReady();
 	const projectPath = params.path.replace(/\/ideas\/\d+\/run$/, '');
 	const ideaId = parseInt(params.id, 10);
 	if (isNaN(ideaId) || ideaId < 1) throw error(400, 'Invalid idea ID');

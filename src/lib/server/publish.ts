@@ -22,6 +22,7 @@
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createServer } from 'node:net';
 import { readDeployConfig, writeDeployConfig, type DeployConfig } from './preview.js';
 import { upsertRoute, removeRoute } from './caddy.js';
 import { getConfig } from './config.js';
@@ -87,12 +88,26 @@ const HOST_PORT_END = 49999;
 const allocatedHostPorts = new Set<number>();
 
 /**
+ * Check whether a port is actually free on the OS by attempting to bind it.
+ */
+function isPortFree(port: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const srv = createServer();
+		srv.once('error', () => resolve(false));
+		srv.listen(port, '0.0.0.0', () => {
+			srv.close(() => resolve(true));
+		});
+	});
+}
+
+/**
  * Pick the next free host port that isn't already allocated in-memory
  * and isn't bound on the OS.
  */
 async function allocateHostPort(): Promise<number> {
 	for (let port = HOST_PORT_START; port <= HOST_PORT_END; port++) {
 		if (allocatedHostPorts.has(port)) continue;
+		if (!(await isPortFree(port))) continue;
 		allocatedHostPorts.add(port);
 		return port;
 	}
@@ -247,6 +262,7 @@ export async function updatePublishSettings(
 	projectName: string,
 	settings: PublishSettings
 ): Promise<DeployConfig> {
+	return withDeployLock(vibezzzDir, async () => {
 	const deploy = (await readDeployConfig(vibezzzDir)) ?? {
 		preview: {
 			command: '',
@@ -350,6 +366,7 @@ export async function updatePublishSettings(
 
 	await writeDeployConfig(vibezzzDir, deploy);
 	return deploy;
+	});
 }
 
 /**
@@ -361,6 +378,7 @@ export async function applyPublishState(
 	projectName: string,
 	targetState: PublishState
 ): Promise<DeployConfig> {
+	return withDeployLock(vibezzzDir, async () => {
 	const config = getConfig();
 
 	const deploy = (await readDeployConfig(vibezzzDir)) ?? {
@@ -505,6 +523,7 @@ export async function applyPublishState(
 
 	await writeDeployConfig(vibezzzDir, deploy);
 	return deploy;
+	});
 }
 
 /**
@@ -663,16 +682,26 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				return false;
 			}
 
-			// Persist container_id and host_port atomically via the deploy lock
-			await withDeployLock(entry.vibezzzDir, async () => {
-				const deploy = await readDeployConfig(entry.vibezzzDir);
-				if (deploy?.publish) {
-					deploy.publish.container_id = containerId;
-					deploy.publish.host_port = hostPort;
-					deploy.publish.last_request_at = new Date().toISOString();
-					await writeDeployConfig(entry.vibezzzDir, deploy);
-				}
-			});
+			// Persist container_id and host_port atomically via the deploy lock.
+			// If persistence fails, roll back the running container and port
+			// so we don't leak resources.
+			try {
+				await withDeployLock(entry.vibezzzDir, async () => {
+					const deploy = await readDeployConfig(entry.vibezzzDir);
+					if (deploy?.publish) {
+						deploy.publish.container_id = containerId;
+						deploy.publish.host_port = hostPort;
+						deploy.publish.last_request_at = new Date().toISOString();
+						await writeDeployConfig(entry.vibezzzDir, deploy);
+					}
+				});
+			} catch (persistErr) {
+				console.error(`[publish] Lazy wake persistence failed for ${entry.containerName}, rolling back: ${(persistErr as Error).message}`);
+				await stopContainer(entry.containerName);
+				releaseHostPort(hostPort);
+				entry.hostPort = null;
+				return false;
+			}
 
 			console.log(`[publish] Lazy wake: started ${entry.containerName} for ${subdomain}`);
 			return true;
