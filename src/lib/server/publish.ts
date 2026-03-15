@@ -162,19 +162,20 @@ function trackHostPort(port: number | null | undefined): void {
 }
 
 /**
- * Clear stale retired-route metadata (in-memory and persisted) for a
- * route ID that is now active again.  Does NOT persist — callers must
- * arrange their own writeDeployConfig.
+ * Clear stale retired-route metadata (persisted object fields) for a
+ * route ID that is now active again.  Mutates the pub object for
+ * persistence but defers the in-memory port release until the caller
+ * confirms a successful writeDeployConfig.
+ *
+ * Returns a commit callback that releases the in-memory port
+ * reservation.  Callers MUST invoke it after a successful persist so
+ * the in-memory state is never ahead of disk.
  */
 function clearRetiredRouteMetadata(
 	pub: { retired_routes?: string[]; retired_route_ports?: Record<string, number> },
 	routeId: string
-): void {
+): () => void {
 	const retiredPort = retiredRoutePorts.get(routeId);
-	if (retiredPort != null) {
-		releaseHostPort(retiredPort);
-		retiredRoutePorts.delete(routeId);
-	}
 	if (pub.retired_routes) {
 		const idx = pub.retired_routes.indexOf(routeId);
 		if (idx >= 0) pub.retired_routes.splice(idx, 1);
@@ -186,6 +187,13 @@ function clearRetiredRouteMetadata(
 			pub.retired_route_ports = undefined;
 		}
 	}
+	// Release in-memory reservation only after the caller persists successfully
+	return () => {
+		if (retiredPort != null) {
+			releaseHostPort(retiredPort);
+			retiredRoutePorts.delete(routeId);
+		}
+	};
 }
 
 export function getLazyRegistry(): ReadonlyMap<string, LazyEntry> {
@@ -501,8 +509,9 @@ export async function updatePublishSettings(
 			if (retiredRoutePorts.has(deploy.publish.caddy_route_id) ||
 				deploy.publish.retired_route_ports?.[deploy.publish.caddy_route_id] != null ||
 				deploy.publish.retired_routes?.includes(deploy.publish.caddy_route_id)) {
-				clearRetiredRouteMetadata(deploy.publish, deploy.publish.caddy_route_id);
+				const commitRetired = clearRetiredRouteMetadata(deploy.publish, deploy.publish.caddy_route_id);
 				await writeDeployConfig(vibezzzDir, deploy);
+				commitRetired();
 			}
 		} else {
 			// Keep port tracked while the stale direct route still references it
@@ -556,8 +565,9 @@ export async function updatePublishSettings(
 				deploy.publish.retired_route_ports?.[oldRouteToRemove] != null ||
 				deploy.publish.retired_routes?.includes(oldRouteToRemove);
 			if (hadRetired) {
-				clearRetiredRouteMetadata(deploy.publish, oldRouteToRemove);
+				const commitRetired = clearRetiredRouteMetadata(deploy.publish, oldRouteToRemove);
 				await writeDeployConfig(vibezzzDir, deploy);
+				commitRetired();
 			}
 		}
 	}
@@ -755,8 +765,9 @@ export async function applyPublishState(
 		if (pub.retired_routes?.includes(pub.caddy_route_id) ||
 			pub.retired_route_ports?.[pub.caddy_route_id] != null ||
 			retiredRoutePorts.has(pub.caddy_route_id)) {
-			clearRetiredRouteMetadata(pub, pub.caddy_route_id);
+			const commitRetired = clearRetiredRouteMetadata(pub, pub.caddy_route_id);
 			await writeDeployConfig(vibezzzDir, deploy);
+			commitRetired();
 		}
 
 		// Safe to remove the lazy entry now
@@ -832,11 +843,12 @@ export async function applyPublishState(
 		pub.url = `https://${host}`;
 
 		// Clear stale retired-route metadata now that this route is active
-		clearRetiredRouteMetadata(pub, pub.caddy_route_id);
+		const commitRetiredCleanup = clearRetiredRouteMetadata(pub, pub.caddy_route_id);
 
 		// Persist before destructive runtime changes
 		try {
 			await writeDeployConfig(vibezzzDir, deploy);
+			commitRetiredCleanup();
 		} catch (err) {
 			// Restore prior state, undo lazy registration, restore direct route
 			lazyRegistry.delete(pub.subdomain);
@@ -929,8 +941,9 @@ export async function applyPublishState(
 				pub.retired_route_ports?.[pub.caddy_route_id] != null ||
 				pub.retired_routes?.includes(pub.caddy_route_id);
 			if (hadRetired) {
-				clearRetiredRouteMetadata(pub, pub.caddy_route_id);
+				const commitRetired = clearRetiredRouteMetadata(pub, pub.caddy_route_id);
 				await writeDeployConfig(vibezzzDir, deploy);
+				commitRetired();
 			}
 		}
 
@@ -1311,8 +1324,9 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 						if (retiredRoutePorts.has(deploy.publish.caddy_route_id) ||
 							deploy.publish.retired_route_ports?.[deploy.publish.caddy_route_id] != null ||
 							deploy.publish.retired_routes?.includes(deploy.publish.caddy_route_id)) {
-							clearRetiredRouteMetadata(deploy.publish, deploy.publish.caddy_route_id);
+							const commitRetired = clearRetiredRouteMetadata(deploy.publish, deploy.publish.caddy_route_id);
 							await writeDeployConfig(entry.vibezzzDir, deploy);
+							commitRetired();
 						}
 					} else {
 						// State, identity, or settings changed during wake — abort
