@@ -92,6 +92,10 @@ interface LazyEntry {
 const lazyRegistry = new Map<string, LazyEntry>();
 let idleTimerHandle: ReturnType<typeof setInterval> | null = null;
 
+// Maps retired Caddy route ID → host port so the port can be released
+// when the retired route is finally cleaned up by reconciliation.
+const retiredRoutePorts = new Map<string, number>();
+
 // ── Host port allocation ────────────────────────────────────────────
 //
 // Published containers expose a dynamic host port distinct from their
@@ -839,6 +843,7 @@ export async function applyPublishState(
 		if (!routeOk) {
 			// Keep port tracked while the stale route still references it
 			trackHostPort(priorHostPort);
+			if (priorHostPort != null) retiredRoutePorts.set(pub.caddy_route_id, priorHostPort);
 			// Persist the retired route ID so reconciliation can retry cleanup
 			if (!pub.retired_routes) pub.retired_routes = [];
 			if (!pub.retired_routes.includes(pub.caddy_route_id)) {
@@ -900,6 +905,12 @@ export async function reconcilePublish(
 				console.warn(`[publish] Reconcile: retired route ${routeId} still could not be removed for ${projectPath}`);
 			} else {
 				console.log(`[publish] Reconcile: cleaned up retired route ${routeId} for ${projectPath}`);
+				// Release the host port that was held while the stale route existed
+				const retiredPort = retiredRoutePorts.get(routeId);
+				if (retiredPort != null) {
+					releaseHostPort(retiredPort);
+					retiredRoutePorts.delete(routeId);
+				}
 				// Clean up any sentinel left by a previous reconciliation
 				const staleSubdomain = routeId.replace(/^vibebox-/, '');
 				const existingSentinel = lazyRegistry.get(staleSubdomain);
@@ -950,6 +961,7 @@ export async function reconcilePublish(
 				releaseHostPort(stalePort);
 			} else {
 				trackHostPort(stalePort);
+				if (stalePort != null) retiredRoutePorts.set(pub.caddy_route_id, stalePort);
 				if (!pub.retired_routes) pub.retired_routes = [];
 				if (!pub.retired_routes.includes(pub.caddy_route_id)) {
 					pub.retired_routes.push(pub.caddy_route_id);
@@ -970,11 +982,14 @@ export async function reconcilePublish(
 	}
 
 	if (pub.state === 'lazy' && pub.subdomain && pub.image) {
-		// Clear stale container metadata (mirrors the 'up' reconciliation path)
+		// Clear stale container metadata (mirrors the 'up' reconciliation path).
+		// Defer port release until after the wake route is restored so the
+		// stale direct route never references a port given to another container.
+		let stalePort: number | null = null;
 		if (pub.container_id) {
 			const running = await containerIsRunning(pub.container_name);
 			if (!running) {
-				releaseHostPort(pub.host_port);
+				stalePort = pub.host_port;
 				pub.container_id = null;
 				pub.host_port = null;
 				await writeDeployConfig(vibezzzDir, deploy);
@@ -989,12 +1004,16 @@ export async function reconcilePublish(
 		const host = `${pub.subdomain}.${config.domain}`;
 		const routeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
 		if (routeOk) {
+			releaseHostPort(stalePort);
 			if (pub.needs_wake_route) {
 				pub.needs_wake_route = undefined;
 				await writeDeployConfig(vibezzzDir, deploy);
 				console.log(`[publish] Reconcile: restored pending wake route for ${projectPath}`);
 			}
 		} else {
+			// Wake route failed — keep stale port reserved so no other
+			// container is allocated a port still referenced by Caddy.
+			trackHostPort(stalePort);
 			if (!pub.needs_wake_route) {
 				pub.needs_wake_route = true;
 				await writeDeployConfig(vibezzzDir, deploy);
