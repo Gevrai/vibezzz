@@ -29,6 +29,7 @@ import { getConfig } from './config.js';
 import { readYaml, writeYaml } from './yaml.js';
 import { notify } from './notifications.js';
 import { scanProjects } from './projects.js';
+import { withDeployLock } from './deploy-lock.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -130,31 +131,6 @@ export function getLazyRegistry(): ReadonlyMap<string, LazyEntry> {
 
 function runtime(): string {
 	return getConfig().containerRuntime;
-}
-
-// ── deploy.yaml serialization lock ──────────────────────────────────
-//
-// All async read-modify-write cycles on a project's deploy.yaml go through
-// this per-directory lock so concurrent writers (idle timer, persistLastRequest,
-// wakeAndProxy) don't clobber each other.
-
-const deployLocks = new Map<string, Promise<void>>();
-
-async function withDeployLock<T>(vibezzzDir: string, fn: () => Promise<T>): Promise<T> {
-	const prev = deployLocks.get(vibezzzDir) ?? Promise.resolve();
-	let release: () => void;
-	const next = new Promise<void>((r) => { release = r; });
-	deployLocks.set(vibezzzDir, next);
-
-	await prev;
-	try {
-		return await fn();
-	} finally {
-		release!();
-		if (deployLocks.get(vibezzzDir) === next) {
-			deployLocks.delete(vibezzzDir);
-		}
-	}
 }
 
 export function defaultPublish(projectName: string): PublishConfig {
@@ -283,18 +259,20 @@ export async function updatePublishSettings(
 	}
 
 	if (settings.image !== undefined) deploy.publish.image = settings.image;
+
+	// Track deferred live side-effects for after the persist step
+	let oldRouteToRemove: string | null = null;
+	let oldSubdomainToDelete: string | null = null;
+	let lazyReRegistration: (() => void) | null = null;
+
 	if (settings.subdomain !== undefined && settings.subdomain !== deploy.publish.subdomain) {
 		const oldSubdomain = deploy.publish.subdomain;
 		const oldRouteId = deploy.publish.caddy_route_id;
 		const oldContainerName = deploy.publish.container_name;
 		const previousState = deploy.publish.state;
 
-		// Clean up stale routing/registry from the old subdomain when already published
+		// Stop old container if running (name is changing) — not a routing change
 		if (deploy.publish.state !== 'down') {
-			await removeRoute(oldRouteId);
-			lazyRegistry.delete(oldSubdomain);
-
-			// Stop old container if running (name is changing)
 			if (deploy.publish.container_id) {
 				await stopContainer(oldContainerName);
 				releaseHostPort(deploy.publish.host_port);
@@ -306,65 +284,85 @@ export async function updatePublishSettings(
 				deploy.publish.state = 'down';
 				deploy.publish.url = null;
 			}
-			// For lazy: we'll re-register below after updating fields
+
+			// Defer route/registry cleanup until after persist
+			oldRouteToRemove = oldRouteId;
+			oldSubdomainToDelete = oldSubdomain;
 		}
 
 		deploy.publish.subdomain = settings.subdomain;
 		deploy.publish.container_name = `vibebox-${settings.subdomain}`;
 		deploy.publish.caddy_route_id = `vibebox-${settings.subdomain}`;
 
-		// Re-register lazy routing with the new subdomain so the project
-		// stays in lazy-published state instead of dropping to 'down'
+		// Prepare lazy re-registration (deferred until after persist)
 		if (previousState === 'lazy' && deploy.publish.image) {
 			const config = getConfig();
 			const host = `${settings.subdomain}.${config.domain}`;
-			await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
 			deploy.publish.url = `https://${host}`;
 
-			registerLazy(settings.subdomain, {
-				vibezzzDir,
-				projectPath: projectName,
-				containerName: deploy.publish.container_name,
-				containerPort: deploy.publish.container_port,
-				hostPort: null,
-				image: deploy.publish.image,
-				idleTimeout: deploy.publish.idle_timeout || config.lazyIdleTimeout,
-				lastRequestAt: Date.now(),
-				starting: false,
-				startPromise: null
-			});
+			lazyReRegistration = () => {
+				registerLazy(settings.subdomain!, {
+					vibezzzDir,
+					projectPath: projectName,
+					containerName: deploy.publish!.container_name,
+					containerPort: deploy.publish!.container_port,
+					hostPort: null,
+					image: deploy.publish!.image!,
+					idleTimeout: deploy.publish!.idle_timeout || config.lazyIdleTimeout,
+					lastRequestAt: Date.now(),
+					starting: false,
+					startPromise: null
+				});
+			};
 		}
 	}
 	if (settings.container_port !== undefined) deploy.publish.container_port = settings.container_port;
 	if (settings.idle_timeout !== undefined) deploy.publish.idle_timeout = settings.idle_timeout;
 
-	// Sync updated settings to the in-memory lazy registry so wakeAndProxy() uses fresh values
-	const lazyEntry = lazyRegistry.get(deploy.publish.subdomain);
-	if (lazyEntry) {
-		const config = getConfig();
-		const imageChanged = settings.image !== undefined && settings.image !== lazyEntry.image;
-		const portChanged = settings.container_port !== undefined && settings.container_port !== lazyEntry.containerPort;
+	// If image or port changed on a running lazy container, stop it so the
+	// next request triggers a fresh wake with the updated configuration.
+	const existingLazyEntry = lazyRegistry.get(deploy.publish.subdomain);
+	let imageChanged = false;
+	let portChanged = false;
+	if (existingLazyEntry) {
+		imageChanged = settings.image !== undefined && settings.image !== existingLazyEntry.image;
+		portChanged = settings.container_port !== undefined && settings.container_port !== existingLazyEntry.containerPort;
 
-		if (settings.container_port !== undefined) lazyEntry.containerPort = deploy.publish.container_port;
-		if (settings.idle_timeout !== undefined)
-			lazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
-		if (settings.image !== undefined) lazyEntry.image = settings.image;
-
-		// If image or port changed, stop the running container so the next
-		// request triggers a fresh wake with the updated configuration.
 		if (imageChanged || portChanged) {
-			const running = await containerIsRunning(lazyEntry.containerName);
+			const running = await containerIsRunning(existingLazyEntry.containerName);
 			if (running) {
-				await stopContainer(lazyEntry.containerName);
-				releaseHostPort(lazyEntry.hostPort);
-				lazyEntry.hostPort = null;
+				await stopContainer(existingLazyEntry.containerName);
+				releaseHostPort(existingLazyEntry.hostPort);
+				existingLazyEntry.hostPort = null;
 				deploy.publish.container_id = null;
 				deploy.publish.host_port = null;
 			}
 		}
 	}
 
+	// Persist before applying any live routing / registry changes
 	await writeDeployConfig(vibezzzDir, deploy);
+
+	// -- Live side-effects (only reached after successful persist) --
+
+	if (oldRouteToRemove) await removeRoute(oldRouteToRemove);
+	if (oldSubdomainToDelete) lazyRegistry.delete(oldSubdomainToDelete);
+	if (lazyReRegistration) {
+		const config = getConfig();
+		const host = `${settings.subdomain}.${config.domain}`;
+		await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+		lazyReRegistration();
+	}
+
+	// Sync updated settings to the in-memory lazy registry
+	if (existingLazyEntry) {
+		const config = getConfig();
+		if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
+		if (settings.idle_timeout !== undefined)
+			existingLazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
+		if (settings.image !== undefined) existingLazyEntry.image = settings.image;
+	}
+
 	return deploy;
 	});
 }
@@ -410,7 +408,8 @@ export async function applyPublishState(
 			throw new Error('Cannot publish: no subdomain configured');
 		}
 
-		// Remove from lazy registry if transitioning from lazy → up
+		// Save lazy entry so we can restore it if the transition fails
+		const savedLazyEntry = lazyRegistry.get(pub.subdomain) ?? null;
 		lazyRegistry.delete(pub.subdomain);
 
 		// Release any previously allocated host port before allocating a new one
@@ -420,18 +419,30 @@ export async function applyPublishState(
 		const containerId = await startContainer(pub.container_name, pub.image, pub.container_port, hostPort);
 		if (!containerId) {
 			releaseHostPort(hostPort);
+			if (savedLazyEntry) registerLazy(pub.subdomain, savedLazyEntry);
 			throw new Error('Failed to start container');
 		}
 
 		const host = `${pub.subdomain}.${config.domain}`;
-		await upsertRoute(pub.caddy_route_id, host, hostPort);
-
 		pub.state = 'up';
 		pub.container_id = containerId;
 		pub.host_port = hostPort;
 		pub.url = `https://${host}`;
 
-		// Update project stage
+		// Persist before applying live side-effects so a failed write
+		// doesn't leave Caddy routes / meta.yaml out of sync with YAML.
+		try {
+			await writeDeployConfig(vibezzzDir, deploy);
+		} catch (err) {
+			await stopContainer(pub.container_name);
+			releaseHostPort(hostPort);
+			if (savedLazyEntry) registerLazy(pub.subdomain, savedLazyEntry);
+			throw err;
+		}
+
+		// Live side-effects: only reached after successful persist
+		await upsertRoute(pub.caddy_route_id, host, hostPort);
+
 		const metaPath = join(vibezzzDir, 'meta.yaml');
 		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
 		if (meta) {
@@ -454,20 +465,21 @@ export async function applyPublishState(
 			await stopContainer(pub.container_name);
 		}
 
-		// Register a wake route pointing to vibebox's own port so the
-		// SvelteKit handle hook can intercept and start the container on demand
-		const host = `${pub.subdomain}.${config.domain}`;
-		await upsertRoute(pub.caddy_route_id, host, config.port);
-
 		// Release any previously allocated host port — lazy allocates on wake
 		releaseHostPort(pub.host_port);
 
+		const host = `${pub.subdomain}.${config.domain}`;
 		pub.state = 'lazy';
 		pub.container_id = null;
 		pub.host_port = null;
 		pub.url = `https://${host}`;
 
-		// Register in lazy in-memory map for wake-on-request
+		// Persist before live side-effects
+		await writeDeployConfig(vibezzzDir, deploy);
+
+		// Live side-effects: Caddy wake route + lazy registry + meta
+		await upsertRoute(pub.caddy_route_id, host, config.port);
+
 		registerLazy(pub.subdomain, {
 			vibezzzDir,
 			projectPath,
@@ -496,16 +508,19 @@ export async function applyPublishState(
 			await stopContainer(pub.container_name);
 		}
 
-		// Remove Caddy route and lazy registry entry
-		await removeRoute(pub.caddy_route_id);
-		lazyRegistry.delete(pub.subdomain);
-
 		releaseHostPort(pub.host_port);
 
 		pub.state = 'down';
 		pub.container_id = null;
 		pub.host_port = null;
 		pub.url = null;
+
+		// Persist before live side-effects
+		await writeDeployConfig(vibezzzDir, deploy);
+
+		// Live side-effects: Caddy route removal + lazy registry cleanup + meta
+		await removeRoute(pub.caddy_route_id);
+		lazyRegistry.delete(pub.subdomain);
 
 		// Only revert project_stage if it was set to 'published' by the publish flow.
 		// Do NOT touch the stage if it's any other value — that would mutate
@@ -521,7 +536,6 @@ export async function applyPublishState(
 		}
 	}
 
-	await writeDeployConfig(vibezzzDir, deploy);
 	return deploy;
 	});
 }

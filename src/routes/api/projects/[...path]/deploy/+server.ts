@@ -10,6 +10,7 @@ import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { updateDeploySettings, readDeployConfig } from '$lib/server/preview';
 import { updatePublishSettings } from '$lib/server/publish';
+import { reconciliationReady } from '$lib/server/reconcile';
 
 export const GET: RequestHandler = async ({ params }) => {
 	const projectPath = params.path;
@@ -40,6 +41,7 @@ export const GET: RequestHandler = async ({ params }) => {
 };
 
 export const POST: RequestHandler = async ({ params, request }) => {
+	await reconciliationReady();
 	const projectPath = params.path;
 	const { projectsDir } = getConfig();
 	const absPath = join(projectsDir, projectPath);

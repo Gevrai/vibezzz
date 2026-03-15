@@ -11,6 +11,7 @@ import { readYaml, writeYaml } from './yaml.js';
 import { getConfig } from './config.js';
 import { upsertRoute, removeRoute } from './caddy.js';
 import { notify } from './notifications.js';
+import { withDeployLock } from './deploy-lock.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -385,6 +386,7 @@ export async function updateDeploySettings(
 		healthcheckPath?: string;
 	}
 ): Promise<DeployConfig> {
+	return withDeployLock(vibezzzDir, async () => {
 	const deploy = (await readDeployConfig(vibezzzDir)) ?? {
 		preview: {
 			command: '',
@@ -408,4 +410,5 @@ export async function updateDeploySettings(
 
 	await writeDeployConfig(vibezzzDir, deploy);
 	return deploy;
+	});
 }
