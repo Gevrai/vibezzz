@@ -421,17 +421,24 @@ export async function updatePublishSettings(
 				}
 			}
 
-			// Sync new settings into the entry immediately so any wake that
-			// starts after we re-enable uses the correct image/port.
-			if (settings.image !== undefined) existingLazyEntry.image = settings.image;
-			if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
-
-			existingLazyEntry.disabled = false;
+			// Do NOT sync new settings into the entry or re-enable here.
+			// The entry stays disabled until persistence succeeds (below)
+			// so that in-flight wakes abort and no wake can use unpersisted
+			// image/port values.
 		}
 	}
 
-	// Persist before applying any live routing / registry changes
-	await writeDeployConfig(vibezzzDir, deploy);
+	// Persist before applying any live routing / registry changes.
+	// If image/port changed, the lazy entry is still disabled here; on
+	// failure we re-enable it with old (disk-consistent) values.
+	try {
+		await writeDeployConfig(vibezzzDir, deploy);
+	} catch (persistErr) {
+		if (existingLazyEntry && (imageChanged || portChanged)) {
+			existingLazyEntry.disabled = false;
+		}
+		throw persistErr;
+	}
 
 	// -- Live side-effects (only reached after successful persist) --
 
@@ -481,15 +488,17 @@ export async function updatePublishSettings(
 		lazyReRegistration();
 	}
 
-	// Sync updated settings to the in-memory lazy registry.
-	// image/container_port are already synced above when imageChanged||portChanged,
-	// but idle_timeout and non-change cases still need this path.
+	// Sync ALL updated settings to the in-memory lazy registry now that
+	// persistence has succeeded.  Image/port updates were deferred from
+	// the pre-persist block so the entry never diverges from disk state.
 	if (existingLazyEntry) {
 		const config = getConfig();
-		if (settings.container_port !== undefined && !portChanged) existingLazyEntry.containerPort = deploy.publish.container_port;
+		if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
 		if (settings.idle_timeout !== undefined)
 			existingLazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
-		if (settings.image !== undefined && !imageChanged) existingLazyEntry.image = settings.image;
+		if (settings.image !== undefined) existingLazyEntry.image = settings.image;
+		// Re-enable after syncing (was disabled during image/port change teardown)
+		if (existingLazyEntry.disabled) existingLazyEntry.disabled = false;
 	}
 
 	return deploy;
@@ -847,6 +856,11 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 	}
 
 	entry.starting = true;
+	// Capture the image/port at wake start so we can detect if a settings
+	// change races with this wake.  We use these for startContainer AND
+	// verify them before persisting.
+	const wakeImage = entry.image;
+	const wakePort = entry.containerPort;
 	entry.startPromise = (async () => {
 		try {
 			// Allocate a fresh host port for this container
@@ -856,8 +870,8 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 
 			const containerId = await startContainer(
 				entry.containerName,
-				entry.image,
-				entry.containerPort,
+				wakeImage,
+				wakePort,
 				hostPort
 			);
 			if (!containerId) {
@@ -884,9 +898,20 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				return null;
 			}
 
+			// Check if image/port settings changed during wake — the
+			// container was started with stale values and must not persist.
+			if (entry.image !== wakeImage || entry.containerPort !== wakePort) {
+				console.warn(`[publish] Lazy wake aborted: settings changed during wake for ${entry.containerName}`);
+				await stopContainer(entry.containerName);
+				releaseHostPort(hostPort);
+				entry.hostPort = null;
+				return null;
+			}
+
 			// Persist container_id and host_port atomically via the deploy lock.
-			// Revalidates state AND identity (subdomain/container) to prevent
-			// persisting stale metadata after a concurrent subdomain rename or unpublish.
+			// Revalidates state, identity, AND settings to prevent persisting
+			// stale metadata after a concurrent settings change, subdomain
+			// rename, or unpublish.
 			try {
 				await withDeployLock(entry.vibezzzDir, async () => {
 					const deploy = await readDeployConfig(entry.vibezzzDir);
@@ -894,7 +919,9 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 						deploy?.publish &&
 						deploy.publish.state === 'lazy' &&
 						deploy.publish.subdomain === subdomain &&
-						deploy.publish.container_name === entry.containerName
+						deploy.publish.container_name === entry.containerName &&
+						deploy.publish.image === wakeImage &&
+						deploy.publish.container_port === wakePort
 					) {
 						deploy.publish.container_id = containerId;
 						deploy.publish.host_port = hostPort;
@@ -910,8 +937,8 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 							throw new Error(`Failed to switch Caddy route to live container for ${host}`);
 						}
 					} else {
-						// State or identity changed during wake (e.g. unpublished or subdomain renamed) — abort
-						throw new Error('Publish state or identity changed during lazy wake');
+						// State, identity, or settings changed during wake — abort
+						throw new Error('Publish state, identity, or settings changed during lazy wake');
 					}
 				});
 			} catch (persistErr) {
