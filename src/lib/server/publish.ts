@@ -543,9 +543,6 @@ export async function updatePublishSettings(
 		const removed = await removeRoute(oldRouteToRemove);
 		if (!removed) {
 			oldRouteRemoved = false;
-			// Keep port tracked while the stale route still references it
-			trackHostPort(portToRelease);
-			if (portToRelease != null) retiredRoutePorts.set(oldRouteToRemove, portToRelease);
 			// Persist the retired route ID and port so reconciliation can retry cleanup
 			if (!deploy.publish.retired_routes) deploy.publish.retired_routes = [];
 			if (!deploy.publish.retired_routes.includes(oldRouteToRemove)) {
@@ -556,6 +553,9 @@ export async function updatePublishSettings(
 				deploy.publish.retired_route_ports[oldRouteToRemove] = portToRelease;
 			}
 			await writeDeployConfig(vibezzzDir, deploy);
+			// Commit in-memory reservation only after successful persist
+			trackHostPort(portToRelease);
+			if (portToRelease != null) retiredRoutePorts.set(oldRouteToRemove, portToRelease);
 			console.warn(`[publish] Old route ${oldRouteToRemove} removal failed during rename; persisted for reconciliation cleanup`);
 		} else {
 			releaseHostPort(portToRelease);
@@ -915,9 +915,6 @@ export async function applyPublishState(
 		// never reference a port that another container may be given.
 		const routeOk = await removeRoute(pub.caddy_route_id);
 		if (!routeOk) {
-			// Keep port tracked while the stale route still references it
-			trackHostPort(priorHostPort);
-			if (priorHostPort != null) retiredRoutePorts.set(pub.caddy_route_id, priorHostPort);
 			// Persist the retired route ID and port so reconciliation can retry cleanup
 			if (!pub.retired_routes) pub.retired_routes = [];
 			if (!pub.retired_routes.includes(pub.caddy_route_id)) {
@@ -928,6 +925,9 @@ export async function applyPublishState(
 				pub.retired_route_ports[pub.caddy_route_id] = priorHostPort;
 			}
 			await writeDeployConfig(vibezzzDir, deploy);
+			// Commit in-memory reservation only after successful persist
+			trackHostPort(priorHostPort);
+			if (priorHostPort != null) retiredRoutePorts.set(pub.caddy_route_id, priorHostPort);
 			console.warn(`[publish] Caddy route removal failed for ${pub.caddy_route_id}; persisted for reconciliation cleanup`);
 			// Keep the disabled lazy entry as a sentinel so isLazyHost()
 			// still intercepts requests — prevents fall-through to the
@@ -991,15 +991,12 @@ export async function reconcilePublish(
 	// Retry cleanup of any retired routes that failed to remove previously.
 	if (pub.retired_routes && pub.retired_routes.length > 0) {
 		const remaining: string[] = [];
+		const deferredCommits: (() => void)[] = [];
 		for (const routeId of pub.retired_routes) {
 			// Route is now active again — clear stale metadata instead of
 			// trying to remove a live route.
 			if (routeId === pub.caddy_route_id && pub.state !== 'down') {
 				const retiredPort = retiredRoutePorts.get(routeId);
-				if (retiredPort != null) {
-					releaseHostPort(retiredPort);
-					retiredRoutePorts.delete(routeId);
-				}
 				if (pub.retired_route_ports) {
 					delete pub.retired_route_ports[routeId];
 				}
@@ -1007,6 +1004,13 @@ export async function reconcilePublish(
 				const existingSentinel = lazyRegistry.get(staleSubdomain);
 				if (existingSentinel?.disabled) {
 					lazyRegistry.delete(staleSubdomain);
+				}
+				// Defer in-memory port release until after persist
+				if (retiredPort != null) {
+					deferredCommits.push(() => {
+						releaseHostPort(retiredPort);
+						retiredRoutePorts.delete(routeId);
+					});
 				}
 				console.log(`[publish] Reconcile: route ${routeId} is active again for ${projectPath}, cleared retired metadata`);
 				continue;
@@ -1017,14 +1021,16 @@ export async function reconcilePublish(
 				console.warn(`[publish] Reconcile: retired route ${routeId} still could not be removed for ${projectPath}`);
 			} else {
 				console.log(`[publish] Reconcile: cleaned up retired route ${routeId} for ${projectPath}`);
-				// Release the host port that was held while the stale route existed
+				// Prepare disk object cleanup; defer in-memory release until persist
 				const retiredPort = retiredRoutePorts.get(routeId);
-				if (retiredPort != null) {
-					releaseHostPort(retiredPort);
-					retiredRoutePorts.delete(routeId);
-				}
 				if (pub.retired_route_ports) {
 					delete pub.retired_route_ports[routeId];
+				}
+				if (retiredPort != null) {
+					deferredCommits.push(() => {
+						releaseHostPort(retiredPort);
+						retiredRoutePorts.delete(routeId);
+					});
 				}
 				// Clean up any sentinel left by a previous reconciliation
 				const staleSubdomain = routeId.replace(/^vibebox-/, '');
@@ -1039,6 +1045,8 @@ export async function reconcilePublish(
 			pub.retired_route_ports = undefined;
 		}
 		await writeDeployConfig(vibezzzDir, deploy);
+		// Commit in-memory port releases only after successful persist
+		for (const commit of deferredCommits) commit();
 
 		// Register disabled sentinels for retired routes still present in
 		// Caddy so isLazyHost() intercepts requests and wakeAndProxy()
@@ -1075,11 +1083,7 @@ export async function reconcilePublish(
 			pub.host_port = null;
 			pub.url = null;
 			const routeOk = await removeRoute(pub.caddy_route_id);
-			if (routeOk) {
-				releaseHostPort(stalePort);
-			} else {
-				trackHostPort(stalePort);
-				if (stalePort != null) retiredRoutePorts.set(pub.caddy_route_id, stalePort);
+			if (!routeOk) {
 				if (!pub.retired_routes) pub.retired_routes = [];
 				if (!pub.retired_routes.includes(pub.caddy_route_id)) {
 					pub.retired_routes.push(pub.caddy_route_id);
@@ -1091,6 +1095,13 @@ export async function reconcilePublish(
 				console.warn(`[publish] Reconcile: route removal failed for ${pub.caddy_route_id} — persisted for retry`);
 			}
 			await writeDeployConfig(vibezzzDir, deploy);
+			// Commit in-memory state only after successful persist
+			if (routeOk) {
+				releaseHostPort(stalePort);
+			} else {
+				trackHostPort(stalePort);
+				if (stalePort != null) retiredRoutePorts.set(pub.caddy_route_id, stalePort);
+			}
 			console.warn(`[publish] Reconcile: container ${pub.container_name} gone for ${projectPath}, marked down`);
 			return;
 		}
@@ -1126,13 +1137,7 @@ export async function reconcilePublish(
 		const host = `${pub.subdomain}.${config.domain}`;
 		const routeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
 		if (routeOk) {
-			releaseHostPort(stalePort);
-			// Also release any port held from a failed idle-shutdown wake restoration
 			const wakeRetiredPort = retiredRoutePorts.get(pub.caddy_route_id);
-			if (wakeRetiredPort != null && wakeRetiredPort !== stalePort) {
-				releaseHostPort(wakeRetiredPort);
-			}
-			retiredRoutePorts.delete(pub.caddy_route_id);
 			let dirty = false;
 			if (pub.retired_route_ports?.[pub.caddy_route_id] != null) {
 				delete pub.retired_route_ports[pub.caddy_route_id];
@@ -1149,6 +1154,12 @@ export async function reconcilePublish(
 			if (dirty) {
 				await writeDeployConfig(vibezzzDir, deploy);
 			}
+			// Commit in-memory port releases only after successful persist
+			releaseHostPort(stalePort);
+			if (wakeRetiredPort != null && wakeRetiredPort !== stalePort) {
+				releaseHostPort(wakeRetiredPort);
+			}
+			retiredRoutePorts.delete(pub.caddy_route_id);
 		} else {
 			// Wake route failed — keep stale port reserved so no other
 			// container is allocated a port still referenced by Caddy.
@@ -1459,15 +1470,12 @@ export async function checkIdleContainers(): Promise<void> {
 			const config = getConfig();
 			const host = `${subdomain}.${config.domain}`;
 			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
-			if (routeOk) {
-				releaseHostPort(entry.hostPort);
-			} else {
-				// Keep port reserved while Caddy still references it
-				trackHostPort(entry.hostPort);
-				if (entry.hostPort != null) {
-					retiredRoutePorts.set(deploy.publish.caddy_route_id, entry.hostPort);
+			const portToRetire = entry.hostPort;
+			if (!routeOk) {
+				// Prepare disk object for retired-port persistence
+				if (portToRetire != null) {
 					if (!deploy.publish.retired_route_ports) deploy.publish.retired_route_ports = {};
-					deploy.publish.retired_route_ports[deploy.publish.caddy_route_id] = entry.hostPort;
+					deploy.publish.retired_route_ports[deploy.publish.caddy_route_id] = portToRetire;
 				}
 				deploy.publish.needs_wake_route = true;
 				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after idle shutdown — persisted for reconciliation`);
@@ -1477,6 +1485,13 @@ export async function checkIdleContainers(): Promise<void> {
 			deploy.publish.container_id = null;
 			deploy.publish.host_port = null;
 			await writeDeployConfig(entry.vibezzzDir, deploy);
+			// Commit in-memory state only after successful persist
+			if (routeOk) {
+				releaseHostPort(portToRetire);
+			} else {
+				trackHostPort(portToRetire);
+				if (portToRetire != null) retiredRoutePorts.set(deploy.publish.caddy_route_id, portToRetire);
+			}
 		});
 	}
 }
