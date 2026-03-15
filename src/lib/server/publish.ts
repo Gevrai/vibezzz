@@ -532,6 +532,15 @@ export async function updatePublishSettings(
 		} else {
 			// Keep port tracked while the stale direct route still references it
 			trackHostPort(existingLazyEntry.hostPort);
+			// Finalize in-memory lazy entry so the project is not left permanently
+			// disabled with a stale hostPort.  Sync updated settings to match disk
+			// (persist already succeeded), clear the stale hostPort (port is tracked
+			// separately above), and re-enable so reconciliation + next wake works.
+			existingLazyEntry.hostPort = null;
+			if (settings.image !== undefined) existingLazyEntry.image = settings.image;
+			if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
+			if (settings.idle_timeout !== undefined) existingLazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
+			existingLazyEntry.disabled = false;
 			deploy.publish.needs_wake_route = true;
 			await writeDeployConfig(vibezzzDir, deploy);
 			console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after image/port change — persisted for reconciliation`);
