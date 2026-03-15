@@ -1312,3 +1312,184 @@ describe('publish — lazy wake/proxy path', () => {
 		stopIdleTimer();
 	});
 });
+
+describe('publish — updatePublishSettings wake-route restore failure: retired port durability', () => {
+	let tempDir: string;
+	const originalEnv = { ...process.env };
+
+	beforeEach(async () => {
+		vi.resetModules();
+		tempDir = await mkdtemp(join(tmpdir(), 'vibebox-publish-retire-'));
+		setBaseEnv({ PROJECTS_DIR: tempDir });
+		mockSvelteEnv();
+	});
+
+	afterEach(async () => {
+		try {
+			const { stopIdleTimer } = await import('../publish');
+			stopIdleTimer();
+		} catch { /* module may not be loaded */ }
+		await rm(tempDir, { recursive: true, force: true });
+		for (const key of Object.keys(process.env)) {
+			if (!(key in originalEnv)) delete process.env[key];
+		}
+		Object.assign(process.env, originalEnv);
+	});
+
+	it('persists retired_route_ports when wake-route restore fails after image change with running container', async () => {
+		// First upsertRoute call (reconcile) succeeds; second (updatePublishSettings) fails.
+		vi.doMock('../caddy', () => ({
+			upsertRoute: vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false),
+			removeRoute: vi.fn().mockResolvedValue(true),
+			isCaddyAvailable: vi.fn().mockResolvedValue(true)
+		}));
+
+		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
+		await mkdir(vibezzzDir, { recursive: true });
+		const { writeYaml, readYaml } = await import('../yaml');
+		await writeYaml(join(vibezzzDir, 'deploy.yaml'), {
+			preview: {
+				command: '', port: 3001, healthcheck_path: '/', pid: null,
+				process_started_at: null, status: 'stopped', subdomain: '',
+				url: null, public: true, last_ready_at: null
+			},
+			publish: {
+				state: 'lazy',
+				subdomain: 'retire-app',
+				url: 'https://retire-app.test.example.com',
+				image: 'old:v1',
+				container_name: 'vibebox-retire-app',
+				container_id: null,
+				container_port: 3001,
+				idle_timeout: 300,
+				last_request_at: null,
+				caddy_route_id: 'vibebox-retire-app'
+			}
+		});
+
+		const { reconcilePublish, getLazyRegistry, updatePublishSettings, stopIdleTimer } =
+			await import('../publish');
+		await reconcilePublish(vibezzzDir, 'cat/proj');
+
+		// Simulate a container that was lazily woken and is now running on port 12345.
+		// containerIsRunning() returns false (no real Docker), so the stop path is skipped,
+		// but the stale direct route still references this port in Caddy.
+		const entry = getLazyRegistry().get('retire-app') as unknown as Record<string, unknown>;
+		expect(entry).toBeTruthy();
+		entry['hostPort'] = 12345;
+
+		// Changing the image triggers the image-change path, which tries to restore the
+		// wake route. upsertRoute returns false, triggering the failure branch.
+		await expect(
+			updatePublishSettings(vibezzzDir, 'proj', { image: 'new:v2' })
+		).rejects.toThrow('Failed to restore wake route');
+
+		// The stale direct-route port MUST be persisted in retired_route_ports so that
+		// after a restart reconcilePublish can rehydrate it and release it correctly.
+		const deploy = await readYaml<any>(join(vibezzzDir, 'deploy.yaml'), null);
+		expect(deploy.publish.needs_wake_route).toBe(true);
+		expect(deploy.publish.retired_route_ports).toBeTruthy();
+		expect(deploy.publish.retired_route_ports['vibebox-retire-app']).toBe(12345);
+
+		stopIdleTimer();
+	});
+
+	it('does not write retired_route_ports when hostPort is null (no container was running)', async () => {
+		vi.doMock('../caddy', () => ({
+			upsertRoute: vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false),
+			removeRoute: vi.fn().mockResolvedValue(true),
+			isCaddyAvailable: vi.fn().mockResolvedValue(true)
+		}));
+
+		const vibezzzDir = join(tempDir, 'cat', 'proj2', '.vibezzz');
+		await mkdir(vibezzzDir, { recursive: true });
+		const { writeYaml, readYaml } = await import('../yaml');
+		await writeYaml(join(vibezzzDir, 'deploy.yaml'), {
+			preview: {
+				command: '', port: 3001, healthcheck_path: '/', pid: null,
+				process_started_at: null, status: 'stopped', subdomain: '',
+				url: null, public: true, last_ready_at: null
+			},
+			publish: {
+				state: 'lazy',
+				subdomain: 'no-port-app',
+				url: 'https://no-port-app.test.example.com',
+				image: 'old:v1',
+				container_name: 'vibebox-no-port-app',
+				container_id: null,
+				container_port: 3001,
+				idle_timeout: 300,
+				last_request_at: null,
+				caddy_route_id: 'vibebox-no-port-app'
+			}
+		});
+
+		const { reconcilePublish, getLazyRegistry, updatePublishSettings, stopIdleTimer } =
+			await import('../publish');
+		await reconcilePublish(vibezzzDir, 'cat/proj2');
+
+		// Entry has hostPort=null (no container running) — the conditional guard must hold.
+		const entry = getLazyRegistry().get('no-port-app');
+		expect(entry).toBeTruthy();
+
+		await expect(
+			updatePublishSettings(vibezzzDir, 'proj2', { image: 'new:v2' })
+		).rejects.toThrow('Failed to restore wake route');
+
+		const deploy = await readYaml<any>(join(vibezzzDir, 'deploy.yaml'), null);
+		expect(deploy.publish.needs_wake_route).toBe(true);
+		// No port to retire → key should be absent
+		expect(deploy.publish.retired_route_ports).toBeFalsy();
+
+		stopIdleTimer();
+	});
+
+	it('reconcilePublish rehydrates retired_route_ports written by the failure path', async () => {
+		vi.doMock('../caddy', () => ({
+			upsertRoute: vi.fn().mockResolvedValue(true),
+			removeRoute: vi.fn().mockResolvedValue(true),
+			isCaddyAvailable: vi.fn().mockResolvedValue(true)
+		}));
+
+		const vibezzzDir = join(tempDir, 'cat', 'proj3', '.vibezzz');
+		await mkdir(vibezzzDir, { recursive: true });
+		const { writeYaml, readYaml } = await import('../yaml');
+
+		// Simulate the state left on disk after the failure path fires:
+		// needs_wake_route=true and retired_route_ports populated with the stale port.
+		await writeYaml(join(vibezzzDir, 'deploy.yaml'), {
+			preview: {
+				command: '', port: 3001, healthcheck_path: '/', pid: null,
+				process_started_at: null, status: 'stopped', subdomain: '',
+				url: null, public: true, last_ready_at: null
+			},
+			publish: {
+				state: 'lazy',
+				subdomain: 'rehydrate-app',
+				url: 'https://rehydrate-app.test.example.com',
+				image: 'new:v2',
+				container_name: 'vibebox-rehydrate-app',
+				container_id: null,
+				container_port: 3001,
+				idle_timeout: 300,
+				last_request_at: null,
+				caddy_route_id: 'vibebox-rehydrate-app',
+				needs_wake_route: true,
+				retired_route_ports: { 'vibebox-rehydrate-app': 12345 }
+			}
+		});
+
+		const { reconcilePublish, getLazyRegistry, stopIdleTimer } = await import('../publish');
+		await reconcilePublish(vibezzzDir, 'cat/proj3');
+
+		// After successful wake-route restore, retired_route_ports should be cleared.
+		const deploy = await readYaml<any>(join(vibezzzDir, 'deploy.yaml'), null);
+		expect(deploy.publish.needs_wake_route).toBeFalsy();
+		expect(deploy.publish.retired_route_ports).toBeFalsy();
+
+		// Lazy registry should be populated.
+		expect(getLazyRegistry().has('rehydrate-app')).toBe(true);
+
+		stopIdleTimer();
+	});
+});

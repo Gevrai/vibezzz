@@ -530,8 +530,10 @@ export async function updatePublishSettings(
 				commitRetired();
 			}
 		} else {
+			// Capture port before clearing so we can persist the reservation.
+			const portToRetire = existingLazyEntry.hostPort;
 			// Keep port tracked while the stale direct route still references it
-			trackHostPort(existingLazyEntry.hostPort);
+			trackHostPort(portToRetire);
 			// Finalize in-memory lazy entry so the project is not left permanently
 			// disabled with a stale hostPort.  Sync updated settings to match disk
 			// (persist already succeeded), clear the stale hostPort (port is tracked
@@ -541,8 +543,18 @@ export async function updatePublishSettings(
 			if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
 			if (settings.idle_timeout !== undefined) existingLazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
 			existingLazyEntry.disabled = false;
+			// Persist the stale direct-route port so recovery/reconciliation can
+			// release the reservation even after a process restart (mirrors the
+			// analogous idle-shutdown failure path).
+			if (portToRetire != null) {
+				if (!deploy.publish.retired_route_ports) deploy.publish.retired_route_ports = {};
+				deploy.publish.retired_route_ports[deploy.publish.caddy_route_id] = portToRetire;
+			}
 			deploy.publish.needs_wake_route = true;
 			await writeDeployConfig(vibezzzDir, deploy);
+			// Mirror into in-memory map only after successful persist so the port
+			// is always recoverable from disk if the process exits before reconcile.
+			if (portToRetire != null) retiredRoutePorts.set(deploy.publish.caddy_route_id, portToRetire);
 			console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after image/port change — persisted for reconciliation`);
 			throw new Error(`Failed to restore wake route for ${host} after image/port change — hostname unreachable`);
 		}
