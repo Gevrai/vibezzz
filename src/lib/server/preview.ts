@@ -333,6 +333,26 @@ export async function stopPreview(
 		} catch {
 			/* already exited */
 		}
+	} else if (active?.config.pid) {
+		// Rehydrated preview — no ChildProcess handle, kill by PID directly
+		try {
+			process.kill(active.config.pid, 'SIGTERM');
+			await new Promise<void>((resolve) => {
+				const check = setInterval(() => {
+					try {
+						process.kill(active.config.pid!, 0);
+					} catch {
+						clearInterval(check);
+						resolve();
+					}
+				}, 200);
+				setTimeout(() => { clearInterval(check); resolve(); }, 6_000);
+			});
+		} catch { /* already dead */ }
+		// Force-kill if still alive
+		try {
+			process.kill(active.config.pid, 'SIGKILL');
+		} catch { /* already gone */ }
 	}
 	activePreviews.delete(projectPath);
 

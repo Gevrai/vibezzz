@@ -48,9 +48,13 @@ export async function notify(
 	summary: string,
 	url?: string
 ): Promise<void> {
+	// Spec requires project name (not path) in the payload.
+	// Paths are "category/name"; extract the final segment.
+	const projectName = project.includes('/') ? project.split('/').pop()! : project;
+
 	const payload: NotificationPayload = {
 		event,
-		project,
+		project: projectName,
 		summary,
 		url,
 		timestamp: new Date().toISOString()

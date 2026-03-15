@@ -17,6 +17,7 @@ interface ProjectIdea {
 	content: string;
 	created_at: string;
 	status: 'raw' | 'promoted' | 'implemented';
+	project_path: string | null;
 	implemented_at: string | null;
 	git_tag: string | null;
 }
@@ -66,6 +67,7 @@ export const POST: RequestHandler = async ({ params, request }) => {
 		content: body.content.trim(),
 		created_at: new Date().toISOString(),
 		status: 'raw',
+		project_path: params.path,
 		implemented_at: null,
 		git_tag: null
 	};

@@ -10,9 +10,13 @@ import { join } from 'node:path';
 import { mkdir, readFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { readYaml, writeYaml } from './yaml.js';
-import { getProvider, type ProviderName, type RunKind, type RunResult } from './providers.js';
+import { getProvider, gitCommitSha, type ProviderName, type RunKind, type RunResult } from './providers.js';
 import { getConfig } from './config.js';
 import { notify } from './notifications.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -403,13 +407,43 @@ export function rehydrateRun(
 		if (!alive) {
 			clearInterval(pollInterval);
 
-			// Update YAML entry
+			// Update YAML entry — infer real outcome from git state
 			const entries = await readAgentsYaml(vibezzzDir);
 			const idx = entries.findIndex((e) => e.id === entry.id);
 			if (idx !== -1 && entries[idx].status === 'running') {
-				entries[idx].status = 'failed';
+				const commitSha = await gitCommitSha(entry.cwd);
+
+				// Check for merge conflicts → blocked
+				let hasConflicts = false;
+				try {
+					const { stdout } = await execFileAsync(
+						'git', ['ls-files', '--unmerged', '--error-unmatch'], { cwd: entry.cwd }
+					);
+					hasConflicts = stdout.trim().length > 0;
+				} catch { /* no conflicts or git error */ }
+
+				// Check for commits made during the run
+				let hasNewCommits = false;
+				try {
+					const { stdout } = await execFileAsync(
+						'git', ['log', '--oneline', '--since', entry.started_at, '-1'],
+						{ cwd: entry.cwd }
+					);
+					hasNewCommits = stdout.trim().length > 0;
+				} catch { /* git error */ }
+
+				if (hasConflicts) {
+					entries[idx].status = 'failed';
+					entries[idx].result = 'blocked';
+				} else if (hasNewCommits) {
+					entries[idx].status = 'done';
+					entries[idx].result = entry.kind === 'bootstrap' ? 'building' : 'ready_for_test';
+				} else {
+					entries[idx].status = 'failed';
+					entries[idx].result = 'failed';
+				}
 				entries[idx].finished_at = new Date().toISOString();
-				entries[idx].result = 'failed';
+				entries[idx].commit_sha = commitSha;
 				await writeAgentsYaml(vibezzzDir, entries);
 			}
 

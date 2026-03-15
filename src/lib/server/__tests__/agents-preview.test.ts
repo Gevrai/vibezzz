@@ -42,7 +42,7 @@ describe('notifications', () => {
 		const recent = getRecentNotifications();
 		expect(recent.length).toBe(1);
 		expect(recent[0].event).toBe('preview_ready');
-		expect(recent[0].project).toBe('test/project');
+		expect(recent[0].project).toBe('project');
 	});
 
 	it('includes URL in notification when provided', async () => {
