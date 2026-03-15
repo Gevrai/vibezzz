@@ -1476,13 +1476,17 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 							currentDeploy.publish.state === 'lazy' &&
 							currentDeploy.publish.subdomain === subdomain
 						) {
+							// Clear stale live-runtime fields persisted before the failure
+							currentDeploy.publish.container_id = null;
+							currentDeploy.publish.host_port = null;
+
 							const host = `${subdomain}.${config.domain}`;
 							const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
 							if (!routeOk) {
 								currentDeploy.publish.needs_wake_route = true;
-								await writeDeployConfig(entry.vibezzzDir, currentDeploy);
 								console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — persisted for reconciliation`);
 							}
+							await writeDeployConfig(entry.vibezzzDir, currentDeploy);
 						} else {
 							console.log(`[publish] Wake rollback: skipping route restore for ${subdomain} — publish state no longer lazy for this subdomain`);
 						}
