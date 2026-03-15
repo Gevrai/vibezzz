@@ -25,6 +25,10 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (host) {
 		// Strip port from host header if present
 		const hostname = host.split(':')[0];
+		// Await reconciliation so the lazy registry is populated before
+		// checking isLazyHost().  The promise resolves immediately after
+		// the first startup reconciliation completes.
+		await reconciliationReady();
 		if (isLazyHost(hostname)) {
 			const port = await wakeAndProxy(hostname);
 			if (port) {

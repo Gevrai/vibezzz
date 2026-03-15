@@ -614,6 +614,13 @@ describe('publish — notifications', () => {
 	});
 
 	it('lazy transition sends publish_succeeded notification', async () => {
+		// Mock Caddy so the route upsert succeeds (no real Caddy in test)
+		vi.doMock('../caddy', () => ({
+			upsertRoute: vi.fn().mockResolvedValue(true),
+			removeRoute: vi.fn().mockResolvedValue(true),
+			isCaddyAvailable: vi.fn().mockResolvedValue(true)
+		}));
+
 		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
 		await mkdir(vibezzzDir, { recursive: true });
 		const { writeYaml } = await import('../yaml');
@@ -826,6 +833,13 @@ describe('publish — subdomain change while published', () => {
 	});
 
 	it('changing subdomain while lazy re-registers lazy routing with new subdomain', async () => {
+		// Mock Caddy so the route upsert succeeds (no real Caddy in test)
+		vi.doMock('../caddy', () => ({
+			upsertRoute: vi.fn().mockResolvedValue(true),
+			removeRoute: vi.fn().mockResolvedValue(true),
+			isCaddyAvailable: vi.fn().mockResolvedValue(true)
+		}));
+
 		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
 		await mkdir(vibezzzDir, { recursive: true });
 		const { writeYaml } = await import('../yaml');

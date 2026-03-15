@@ -72,6 +72,8 @@ interface LazyEntry {
 	lastRequestAt: number;
 	starting: boolean;
 	startPromise: Promise<boolean> | null;
+	/** Set during unpublish to prevent in-flight wakes from reviving state. */
+	disabled: boolean;
 }
 
 // Maps subdomain → lazy entry for fast lookup during request handling
@@ -311,7 +313,8 @@ export async function updatePublishSettings(
 					idleTimeout: deploy.publish!.idle_timeout || config.lazyIdleTimeout,
 					lastRequestAt: Date.now(),
 					starting: false,
-					startPromise: null
+					startPromise: null,
+					disabled: false
 				});
 			};
 		}
@@ -441,7 +444,19 @@ export async function applyPublishState(
 		}
 
 		// Live side-effects: only reached after successful persist
-		await upsertRoute(pub.caddy_route_id, host, hostPort);
+		const routeOk = await upsertRoute(pub.caddy_route_id, host, hostPort);
+		if (!routeOk) {
+			// Caddy route failed — revert persisted state and clean up
+			await stopContainer(pub.container_name);
+			releaseHostPort(hostPort);
+			pub.state = 'down';
+			pub.container_id = null;
+			pub.host_port = null;
+			pub.url = null;
+			if (savedLazyEntry) registerLazy(pub.subdomain, savedLazyEntry);
+			await writeDeployConfig(vibezzzDir, deploy);
+			throw new Error(`Failed to register Caddy route for ${host}`);
+		}
 
 		const metaPath = join(vibezzzDir, 'meta.yaml');
 		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
@@ -478,7 +493,14 @@ export async function applyPublishState(
 		await writeDeployConfig(vibezzzDir, deploy);
 
 		// Live side-effects: Caddy wake route + lazy registry + meta
-		await upsertRoute(pub.caddy_route_id, host, config.port);
+		const routeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
+		if (!routeOk) {
+			// Caddy route failed — revert persisted state
+			pub.state = 'down';
+			pub.url = null;
+			await writeDeployConfig(vibezzzDir, deploy);
+			throw new Error(`Failed to register Caddy wake route for ${host}`);
+		}
 
 		registerLazy(pub.subdomain, {
 			vibezzzDir,
@@ -490,7 +512,8 @@ export async function applyPublishState(
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
 			lastRequestAt: Date.now(),
 			starting: false,
-			startPromise: null
+			startPromise: null,
+			disabled: false
 		});
 
 		const metaPath = join(vibezzzDir, 'meta.yaml');
@@ -503,6 +526,11 @@ export async function applyPublishState(
 		await notify('publish_succeeded', projectPath, `Published ${projectPath} (lazy)`, pub.url);
 
 	} else if (targetState === 'down') {
+		// Disable lazy entry before transition to prevent in-flight wakes
+		// from reviving runtime metadata after state becomes 'down'.
+		const lazyEntry = lazyRegistry.get(pub.subdomain);
+		if (lazyEntry) lazyEntry.disabled = true;
+
 		// Stop container
 		if (pub.container_id || await containerIsRunning(pub.container_name)) {
 			await stopContainer(pub.container_name);
@@ -519,7 +547,10 @@ export async function applyPublishState(
 		await writeDeployConfig(vibezzzDir, deploy);
 
 		// Live side-effects: Caddy route removal + lazy registry cleanup + meta
-		await removeRoute(pub.caddy_route_id);
+		const routeOk = await removeRoute(pub.caddy_route_id);
+		if (!routeOk) {
+			console.warn(`[publish] Caddy route removal failed for ${pub.caddy_route_id}, route may be stale`);
+		}
 		lazyRegistry.delete(pub.subdomain);
 
 		// Only revert project_stage if it was set to 'published' by the publish flow.
@@ -613,7 +644,8 @@ export async function reconcilePublish(
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
 			lastRequestAt: restoredLastRequest,
 			starting: false,
-			startPromise: null
+			startPromise: null,
+			disabled: false
 		});
 	}
 }
@@ -646,7 +678,7 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 	const subdomain = hostname.slice(0, -(config.domain.length + 1));
 
 	const entry = lazyRegistry.get(subdomain);
-	if (!entry) return null;
+	if (!entry || entry.disabled) return null;
 
 	// Update last-request timestamp
 	entry.lastRequestAt = Date.now();
@@ -696,17 +728,28 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				return false;
 			}
 
+			// Check if entry was disabled during wake (e.g. unpublish started)
+			if (entry.disabled) {
+				await stopContainer(entry.containerName);
+				releaseHostPort(hostPort);
+				entry.hostPort = null;
+				return false;
+			}
+
 			// Persist container_id and host_port atomically via the deploy lock.
-			// If persistence fails, roll back the running container and port
-			// so we don't leak resources.
+			// Revalidates that persisted state is still 'lazy' to prevent
+			// reviving runtime metadata after a concurrent unpublish.
 			try {
 				await withDeployLock(entry.vibezzzDir, async () => {
 					const deploy = await readDeployConfig(entry.vibezzzDir);
-					if (deploy?.publish) {
+					if (deploy?.publish && deploy.publish.state === 'lazy') {
 						deploy.publish.container_id = containerId;
 						deploy.publish.host_port = hostPort;
 						deploy.publish.last_request_at = new Date().toISOString();
 						await writeDeployConfig(entry.vibezzzDir, deploy);
+					} else {
+						// State changed during wake (e.g. unpublished) — abort
+						throw new Error('Publish state changed during lazy wake');
 					}
 				});
 			} catch (persistErr) {
