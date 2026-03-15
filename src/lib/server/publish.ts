@@ -576,12 +576,13 @@ export async function applyPublishState(
 			throw new SubdomainConflictError(pub.subdomain);
 		}
 
-		// Disable the lazy entry before removing it so any in-flight
-		// wakeAndProxy() call aborts instead of continuing to start/persist
-		// a container that the new 'up' transition will replace.
+		// Disable (but don't delete) the lazy entry so any in-flight
+		// wakeAndProxy() call aborts, while isLazyHost() still returns true
+		// — requests get 503 instead of falling through to the main app.
 		const savedLazyEntry = lazyRegistry.get(pub.subdomain) ?? null;
 		if (savedLazyEntry) savedLazyEntry.disabled = true;
-		lazyRegistry.delete(pub.subdomain);
+
+		const host = `${pub.subdomain}.${config.domain}`;
 
 		// Release any previously allocated host port before allocating a new one
 		releaseHostPort(pub.host_port);
@@ -592,12 +593,11 @@ export async function applyPublishState(
 			releaseHostPort(hostPort);
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
-				registerLazy(pub.subdomain, savedLazyEntry);
 			}
+			await upsertRoute(pub.caddy_route_id, host, config.port);
 			throw new Error('Failed to start container');
 		}
 
-		const host = `${pub.subdomain}.${config.domain}`;
 		pub.state = 'up';
 		pub.container_id = containerId;
 		pub.host_port = hostPort;
@@ -612,8 +612,8 @@ export async function applyPublishState(
 			releaseHostPort(hostPort);
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
-				registerLazy(pub.subdomain, savedLazyEntry);
 			}
+			await upsertRoute(pub.caddy_route_id, host, config.port);
 			throw err;
 		}
 
@@ -629,10 +629,15 @@ export async function applyPublishState(
 			pub.url = null;
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
-				registerLazy(pub.subdomain, savedLazyEntry);
 			}
+			await upsertRoute(pub.caddy_route_id, host, config.port);
 			await writeDeployConfig(vibezzzDir, deploy);
 			throw new Error(`Failed to register Caddy route for ${host}`);
+		}
+
+		// Direct route installed — safe to remove the lazy entry now
+		if (savedLazyEntry) {
+			lazyRegistry.delete(pub.subdomain);
 		}
 
 		const metaPath = join(vibezzzDir, 'meta.yaml');
