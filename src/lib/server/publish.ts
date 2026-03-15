@@ -1112,6 +1112,14 @@ export async function reconcilePublish(
 			const host = `${pub.subdomain}.${config.domain}`;
 			await upsertRoute(pub.caddy_route_id, host, pub.host_port ?? pub.container_port);
 		}
+		// Clear stale retired-route metadata now that this route is active
+		if (pub.retired_routes?.includes(pub.caddy_route_id) ||
+			pub.retired_route_ports?.[pub.caddy_route_id] != null ||
+			retiredRoutePorts.has(pub.caddy_route_id)) {
+			const commitRetired = clearRetiredRouteMetadata(pub, pub.caddy_route_id);
+			await writeDeployConfig(vibezzzDir, deploy);
+			commitRetired();
+		}
 	}
 
 	if (pub.state === 'lazy' && pub.subdomain && pub.image) {
@@ -1350,32 +1358,29 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
 
-				// Re-read persisted state before restoring the wake route.
-				// A concurrent rename or unpublish may have retired this
-				// subdomain; blindly restoring would recreate a stale hostname.
-				const currentDeploy = await readDeployConfig(entry.vibezzzDir);
-				if (
-					currentDeploy?.publish &&
-					currentDeploy.publish.state === 'lazy' &&
-					currentDeploy.publish.subdomain === subdomain
-				) {
-					const host = `${subdomain}.${config.domain}`;
-					const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
-					if (!routeOk) {
-						try {
-							await withDeployLock(entry.vibezzzDir, async () => {
-								const d = await readDeployConfig(entry.vibezzzDir);
-								if (d?.publish && d.publish.state === 'lazy' && d.publish.subdomain === subdomain) {
-									d.publish.needs_wake_route = true;
-									await writeDeployConfig(entry.vibezzzDir, d);
-								}
-							});
-						} catch { /* best-effort persist */ }
-						console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — persisted for reconciliation`);
-					}
-				} else {
-					console.log(`[publish] Wake rollback: skipping route restore for ${subdomain} — publish state no longer lazy for this subdomain`);
-				}
+				// Re-read persisted state and restore the wake route under the
+				// deploy lock so a concurrent publish/rename cannot race and
+				// have its route overwritten by stale rollback logic.
+				try {
+					await withDeployLock(entry.vibezzzDir, async () => {
+						const currentDeploy = await readDeployConfig(entry.vibezzzDir);
+						if (
+							currentDeploy?.publish &&
+							currentDeploy.publish.state === 'lazy' &&
+							currentDeploy.publish.subdomain === subdomain
+						) {
+							const host = `${subdomain}.${config.domain}`;
+							const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
+							if (!routeOk) {
+								currentDeploy.publish.needs_wake_route = true;
+								await writeDeployConfig(entry.vibezzzDir, currentDeploy);
+								console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — persisted for reconciliation`);
+							}
+						} else {
+							console.log(`[publish] Wake rollback: skipping route restore for ${subdomain} — publish state no longer lazy for this subdomain`);
+						}
+					});
+				} catch { /* best-effort rollback */ }
 				return null;
 			}
 
