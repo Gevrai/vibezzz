@@ -678,22 +678,22 @@ export async function applyPublishState(
 		// Register the lazy entry BEFORE switching the Caddy route so
 		// isLazyHost() returns true as soon as traffic arrives at vibebox,
 		// preventing requests from falling through to the main app during
-		// the transition window.  Use priorHostPort so wakeAndProxy()
-		// short-circuits to the still-running container if a request
-		// arrives before teardown.
-		registerLazy(pub.subdomain, {
+		// the transition window.  Disabled so wakeAndProxy() cannot
+		// re-point Caddy back to the old container before teardown.
+		const lazyEntry: LazyEntry = {
 			vibezzzDir,
 			projectPath,
 			containerName: pub.container_name,
 			containerPort: pub.container_port,
-			hostPort: priorHostPort ?? null,
+			hostPort: null,
 			image: pub.image!,
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
 			lastRequestAt: Date.now(),
 			starting: false,
 			startPromise: null,
-			disabled: false
-		});
+			disabled: true
+		};
+		registerLazy(pub.subdomain, lazyEntry);
 
 		// Install the Caddy wake route BEFORE tearing down the live
 		// container so a Caddy failure cannot take a working app offline.
@@ -735,21 +735,9 @@ export async function applyPublishState(
 		}
 		releaseHostPort(priorHostPort);
 
-		// Update the lazy entry to its final state (no host port now that
-		// the container is stopped); overwrites the transitional entry above.
-		registerLazy(pub.subdomain, {
-			vibezzzDir,
-			projectPath,
-			containerName: pub.container_name,
-			containerPort: pub.container_port,
-			hostPort: null,
-			image: pub.image!,
-			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
-			lastRequestAt: Date.now(),
-			starting: false,
-			startPromise: null,
-			disabled: false
-		});
+		// Finalize the canonical lazy entry in-place so any in-flight
+		// wakeAndProxy() reference keeps its startPromise / hostPort.
+		lazyEntry.disabled = false;
 
 		const metaPath = join(vibezzzDir, 'meta.yaml');
 		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
