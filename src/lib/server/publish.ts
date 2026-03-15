@@ -484,9 +484,11 @@ export async function updatePublishSettings(
 		}
 	}
 
+	let oldRouteRemoved = true;
 	if (oldRouteToRemove) {
 		const removed = await removeRoute(oldRouteToRemove);
 		if (!removed) {
+			oldRouteRemoved = false;
 			// Persist the retired route ID so reconciliation can retry cleanup
 			if (!deploy.publish.retired_routes) deploy.publish.retired_routes = [];
 			if (!deploy.publish.retired_routes.includes(oldRouteToRemove)) {
@@ -496,7 +498,14 @@ export async function updatePublishSettings(
 			console.warn(`[publish] Old route ${oldRouteToRemove} removal failed during rename; persisted for reconciliation cleanup`);
 		}
 	}
-	if (oldSubdomainToDelete) lazyRegistry.delete(oldSubdomainToDelete);
+	if (oldSubdomainToDelete) {
+		if (oldRouteRemoved) {
+			lazyRegistry.delete(oldSubdomainToDelete);
+		}
+		// else: keep the disabled entry as a sentinel so isLazyHost()
+		// still intercepts requests to the old hostname — prevents
+		// fall-through to the main app while the stale route exists.
+	}
 	if (lazyReRegistration) {
 		const config = getConfig();
 		const host = `${settings.subdomain}.${config.domain}`;
@@ -824,8 +833,12 @@ export async function applyPublishState(
 			}
 			await writeDeployConfig(vibezzzDir, deploy);
 			console.warn(`[publish] Caddy route removal failed for ${pub.caddy_route_id}; persisted for reconciliation cleanup`);
+			// Keep the disabled lazy entry as a sentinel so isLazyHost()
+			// still intercepts requests — prevents fall-through to the
+			// main app while the stale Caddy route exists.
+		} else {
+			lazyRegistry.delete(pub.subdomain);
 		}
-		lazyRegistry.delete(pub.subdomain);
 
 		// Only revert project_stage if it was set to 'published' by the publish flow.
 		// Do NOT touch the stage if it's any other value — that would mutate
@@ -887,7 +900,14 @@ export async function reconcilePublish(
 			pub.container_id = null;
 			pub.host_port = null;
 			pub.url = null;
-			await removeRoute(pub.caddy_route_id);
+			const routeOk = await removeRoute(pub.caddy_route_id);
+			if (!routeOk) {
+				if (!pub.retired_routes) pub.retired_routes = [];
+				if (!pub.retired_routes.includes(pub.caddy_route_id)) {
+					pub.retired_routes.push(pub.caddy_route_id);
+				}
+				console.warn(`[publish] Reconcile: route removal failed for ${pub.caddy_route_id} — persisted for retry`);
+			}
 			await writeDeployConfig(vibezzzDir, deploy);
 			console.warn(`[publish] Reconcile: container ${pub.container_name} gone for ${projectPath}, marked down`);
 			return;
