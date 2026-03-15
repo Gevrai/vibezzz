@@ -211,27 +211,50 @@ export async function updatePublishSettings(
 		const oldSubdomain = deploy.publish.subdomain;
 		const oldRouteId = deploy.publish.caddy_route_id;
 		const oldContainerName = deploy.publish.container_name;
+		const previousState = deploy.publish.state;
 
 		// Clean up stale routing/registry from the old subdomain when already published
 		if (deploy.publish.state !== 'down') {
 			await removeRoute(oldRouteId);
 			lazyRegistry.delete(oldSubdomain);
 
-			// Stop old container if state is 'up' and container name is changing
-			if (deploy.publish.state === 'up' && deploy.publish.container_id) {
+			// Stop old container if running (name is changing)
+			if (deploy.publish.container_id) {
 				await stopContainer(oldContainerName);
 				deploy.publish.container_id = null;
-				deploy.publish.state = 'down';
-				deploy.publish.url = null;
-			} else if (deploy.publish.state === 'lazy') {
+			}
+
+			if (previousState === 'up') {
 				deploy.publish.state = 'down';
 				deploy.publish.url = null;
 			}
+			// For lazy: we'll re-register below after updating fields
 		}
 
 		deploy.publish.subdomain = settings.subdomain;
 		deploy.publish.container_name = `vibebox-${settings.subdomain}`;
 		deploy.publish.caddy_route_id = `vibebox-${settings.subdomain}`;
+
+		// Re-register lazy routing with the new subdomain so the project
+		// stays in lazy-published state instead of dropping to 'down'
+		if (previousState === 'lazy' && deploy.publish.image) {
+			const config = getConfig();
+			const host = `${settings.subdomain}.${config.domain}`;
+			await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+			deploy.publish.url = `https://${host}`;
+
+			registerLazy(settings.subdomain, {
+				vibezzzDir,
+				projectPath: projectName,
+				containerName: deploy.publish.container_name,
+				containerPort: deploy.publish.container_port,
+				image: deploy.publish.image,
+				idleTimeout: deploy.publish.idle_timeout || config.lazyIdleTimeout,
+				lastRequestAt: Date.now(),
+				starting: false,
+				startPromise: null
+			});
+		}
 	}
 	if (settings.container_port !== undefined) deploy.publish.container_port = settings.container_port;
 	if (settings.idle_timeout !== undefined) deploy.publish.idle_timeout = settings.idle_timeout;
@@ -240,10 +263,23 @@ export async function updatePublishSettings(
 	const lazyEntry = lazyRegistry.get(deploy.publish.subdomain);
 	if (lazyEntry) {
 		const config = getConfig();
+		const imageChanged = settings.image !== undefined && settings.image !== lazyEntry.image;
+		const portChanged = settings.container_port !== undefined && settings.container_port !== lazyEntry.containerPort;
+
 		if (settings.container_port !== undefined) lazyEntry.containerPort = deploy.publish.container_port;
 		if (settings.idle_timeout !== undefined)
 			lazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
 		if (settings.image !== undefined) lazyEntry.image = settings.image;
+
+		// If image or port changed, stop the running container so the next
+		// request triggers a fresh wake with the updated configuration.
+		if (imageChanged || portChanged) {
+			const running = await containerIsRunning(lazyEntry.containerName);
+			if (running) {
+				await stopContainer(lazyEntry.containerName);
+				deploy.publish.container_id = null;
+			}
+		}
 	}
 
 	await writeDeployConfig(vibezzzDir, deploy);

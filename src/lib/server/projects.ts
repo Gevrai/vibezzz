@@ -1,5 +1,5 @@
 import { join, resolve } from 'node:path';
-import { readdir, stat, lstat, access, realpath, rm, mkdir } from 'node:fs/promises';
+import { readdir, stat, lstat, access, realpath, rm, mkdir, rename } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readYaml, writeYaml } from './yaml';
@@ -531,4 +531,95 @@ export async function promoteIdeaToProject(opts: PromoteOptions): Promise<Scanne
 			throw bootstrapErr;
 		}
 	});
+}
+
+/**
+ * Move a project to a different category by renaming its parent directory.
+ * Updates meta.yaml to reflect the new category. Rejects moves for projects
+ * with active publish state to avoid breaking live routing.
+ */
+export async function moveProject(
+	currentPath: string,
+	targetCategory: string
+): Promise<ScannedProject> {
+	const { projectsDir } = getConfig();
+
+	if (!isValidPathSegment(targetCategory)) {
+		throw new Error('Invalid target category name');
+	}
+
+	const segments = currentPath.split('/');
+	if (segments.length < 2) {
+		throw new Error('Invalid project path');
+	}
+	const projectName = segments[segments.length - 1];
+	const currentCategory = segments[0];
+
+	if (targetCategory === currentCategory) {
+		throw new Error('Project is already in this category');
+	}
+
+	// Resolve and verify the source project
+	const srcAbs = join(projectsDir, currentPath);
+	const realSrc = await resolveAndVerifyDir(srcAbs, projectsDir);
+
+	// Ensure destination category exists
+	const destCategoryDir = join(projectsDir, targetCategory);
+	await mkdir(destCategoryDir, { recursive: true });
+	const realCategoryDir = await resolveAndVerifyDir(destCategoryDir, projectsDir);
+
+	const destAbs = join(realCategoryDir, projectName);
+
+	// Verify destination doesn't exist
+	if (await isDirectory(destAbs)) {
+		throw new Error(`A project named "${projectName}" already exists in category "${targetCategory}"`);
+	}
+
+	// Reject move if project is published (would break routing)
+	const vibezzzDir = await verifyVibezzzDir(realSrc);
+	if (vibezzzDir) {
+		const deploy = await readYaml<{ publish?: { state?: string } } | null>(
+			join(vibezzzDir, 'deploy.yaml'),
+			null
+		);
+		if (deploy?.publish?.state && deploy.publish.state !== 'down') {
+			throw new Error('Cannot move a published project — unpublish first');
+		}
+	}
+
+	// Move the directory
+	await rename(realSrc, destAbs);
+
+	// Update meta.yaml category field
+	const newVibezzzDir = await verifyVibezzzDir(destAbs);
+	if (newVibezzzDir) {
+		const metaPath = join(newVibezzzDir, 'meta.yaml');
+		const meta = await readYaml<ProjectMeta | null>(metaPath, null);
+		if (meta) {
+			meta.category = targetCategory;
+			await writeYaml(metaPath, meta);
+		}
+	}
+
+	// Return updated project data
+	const newPath = join(targetCategory, projectName);
+	const signals = newVibezzzDir ? await readSignals(newVibezzzDir) : { ...DEFAULT_SIGNALS };
+	const meta = newVibezzzDir
+		? await readYaml<ProjectMeta | null>(join(newVibezzzDir, 'meta.yaml'), null)
+		: null;
+
+	return {
+		path: newPath,
+		meta: meta ?? {
+			name: projectName,
+			category: targetCategory,
+			origin: 'external',
+			created_at: new Date().toISOString(),
+			idea_id: null,
+			template: null,
+			project_stage: 'paused',
+			last_ready_at: null
+		},
+		signals
+	};
 }

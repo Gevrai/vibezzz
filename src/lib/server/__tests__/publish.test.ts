@@ -780,7 +780,7 @@ describe('publish — subdomain change while published', () => {
 		Object.assign(process.env, originalEnv);
 	});
 
-	it('changing subdomain while lazy clears old registry entry and resets state to down', async () => {
+	it('changing subdomain while lazy re-registers lazy routing with new subdomain', async () => {
 		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
 		await mkdir(vibezzzDir, { recursive: true });
 		const { writeYaml } = await import('../yaml');
@@ -824,12 +824,16 @@ describe('publish — subdomain change while published', () => {
 		expect(getLazyRegistry().has('old-sub')).toBe(false);
 		expect(isLazyHost('old-sub.test.example.com')).toBe(false);
 
-		// State should be reset to down (needs re-publish with new subdomain)
-		expect(result.publish!.state).toBe('down');
+		// State should remain lazy with new subdomain re-registered
+		expect(result.publish!.state).toBe('lazy');
 		expect(result.publish!.subdomain).toBe('new-sub');
 		expect(result.publish!.container_name).toBe('vibebox-new-sub');
 		expect(result.publish!.caddy_route_id).toBe('vibebox-new-sub');
-		expect(result.publish!.url).toBeNull();
+		expect(result.publish!.url).toBe('https://new-sub.test.example.com');
+
+		// New subdomain should be in the lazy registry
+		expect(getLazyRegistry().has('new-sub')).toBe(true);
+		expect(isLazyHost('new-sub.test.example.com')).toBe(true);
 
 		stopIdleTimer();
 	});
