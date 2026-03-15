@@ -1,11 +1,16 @@
 /**
  * Startup reconciliation.
  *
- * On vibebox startup, scans all projects for stale agent runs and
- * preview processes.  A run/preview is considered stale when:
+ * On vibebox startup, scans all projects for stale agent runs,
+ * preview processes, and publish state.  A run/preview is considered stale when:
  *   - the PID no longer exists
  *   - the process start time doesn't match
  *   - the process doesn't belong to the expected working directory
+ *
+ * Publish reconciliation:
+ *   - Verifies containers for `state: up` projects are still running
+ *   - Re-registers Caddy routes for published/lazy projects
+ *   - Populates the lazy wake registry for `state: lazy` projects
  *
  * Also rehydrates live previews into the in-memory map so the monitor
  * and live UI surfaces work immediately after restart.
@@ -21,6 +26,7 @@ import { checkPreviewHealth, rehydratePreview } from './preview.js';
 import type { AgentRunEntry } from './agents.js';
 import { rehydrateRun } from './agents.js';
 import type { DeployConfig } from './preview.js';
+import { reconcilePublish } from './publish.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -238,6 +244,15 @@ export async function reconcileOnStartup(): Promise<void> {
 						}
 					}
 				}
+			}
+
+			// Reconcile publish state (containers + Caddy routes + lazy registry)
+			try {
+				await reconcilePublish(vibezzzDir, project.path);
+			} catch (err) {
+				console.warn(
+					`[reconcile] Error reconciling publish for ${project.path}: ${(err as Error).message}`
+				);
 			}
 		} catch (err) {
 			console.warn(

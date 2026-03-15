@@ -5,12 +5,18 @@
  * registering Caddy routes, and persisting state in deploy.yaml.
  *
  * publish state transitions:
- *   down → up    : start container, register route
- *   down → lazy  : register wake route (container starts on first request)
+ *   down → up    : start container, register route to container
+ *   down → lazy  : register wake route to vibebox app, container starts on first request
  *   up   → down  : stop container, remove route
  *   lazy → down  : remove wake route, stop container if running
  *   up   → lazy  : stop container, register wake route
  *   lazy → up    : start container, register direct route
+ *
+ * Lazy wake semantics:
+ *   - Caddy route points to vibebox's own port
+ *   - hooks.server.ts intercepts requests by hostname and calls wakeAndProxy()
+ *   - wakeAndProxy() starts the container on demand, waits for health, proxies through
+ *   - Background idle timer stops containers after idle_timeout seconds
  */
 
 import { join } from 'node:path';
@@ -21,6 +27,7 @@ import { upsertRoute, removeRoute } from './caddy.js';
 import { getConfig } from './config.js';
 import { readYaml, writeYaml } from './yaml.js';
 import { notify } from './notifications.js';
+import { scanProjects } from './projects.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -36,7 +43,7 @@ export interface PublishSettings {
 	idle_timeout?: number;
 }
 
-interface PublishConfig {
+export interface PublishConfig {
 	state: string;
 	subdomain: string;
 	url: string | null;
@@ -49,13 +56,35 @@ interface PublishConfig {
 	caddy_route_id: string;
 }
 
+// ── In-memory lazy tracking ─────────────────────────────────────────
+
+interface LazyEntry {
+	vibezzzDir: string;
+	projectPath: string;
+	containerName: string;
+	containerPort: number;
+	image: string;
+	idleTimeout: number;
+	lastRequestAt: number;
+	starting: boolean;
+	startPromise: Promise<boolean> | null;
+}
+
+// Maps subdomain → lazy entry for fast lookup during request handling
+const lazyRegistry = new Map<string, LazyEntry>();
+let idleTimerHandle: ReturnType<typeof setInterval> | null = null;
+
+export function getLazyRegistry(): ReadonlyMap<string, LazyEntry> {
+	return lazyRegistry;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function runtime(): string {
 	return getConfig().containerRuntime;
 }
 
-function defaultPublish(projectName: string): PublishConfig {
+export function defaultPublish(projectName: string): PublishConfig {
 	const subdomain = projectName.replace(/[^a-z0-9-]/gi, '-').toLowerCase();
 	return {
 		state: 'down',
@@ -71,7 +100,7 @@ function defaultPublish(projectName: string): PublishConfig {
 	};
 }
 
-async function containerExists(name: string): Promise<boolean> {
+export async function containerExists(name: string): Promise<boolean> {
 	try {
 		await execFileAsync(runtime(), ['inspect', name]);
 		return true;
@@ -80,7 +109,7 @@ async function containerExists(name: string): Promise<boolean> {
 	}
 }
 
-async function containerIsRunning(name: string): Promise<boolean> {
+export async function containerIsRunning(name: string): Promise<boolean> {
 	try {
 		const { stdout } = await execFileAsync(
 			runtime(),
@@ -92,7 +121,7 @@ async function containerIsRunning(name: string): Promise<boolean> {
 	}
 }
 
-async function startContainer(
+export async function startContainer(
 	name: string,
 	image: string,
 	port: number
@@ -119,13 +148,33 @@ async function startContainer(
 	}
 }
 
-async function stopContainer(name: string): Promise<void> {
+export async function stopContainer(name: string): Promise<void> {
 	try {
 		await execFileAsync(runtime(), ['stop', name], { timeout: 15_000 });
 	} catch { /* already stopped or doesn't exist */ }
 	try {
 		await execFileAsync(runtime(), ['rm', '-f', name]);
 	} catch { /* already removed */ }
+}
+
+async function waitForContainerHealthy(
+	port: number,
+	timeoutMs: number = 30_000,
+	intervalMs: number = 500
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			const resp = await fetch(`http://localhost:${port}/`, {
+				signal: AbortSignal.timeout(2_000)
+			});
+			if (resp.ok) return true;
+		} catch {
+			/* not ready yet */
+		}
+		await new Promise((r) => setTimeout(r, intervalMs));
+	}
+	return false;
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -210,6 +259,9 @@ export async function applyPublishState(
 			throw new Error('Cannot publish: no subdomain configured');
 		}
 
+		// Remove from lazy registry if transitioning from lazy → up
+		lazyRegistry.delete(pub.subdomain);
+
 		const containerId = await startContainer(pub.container_name, pub.image, pub.container_port);
 		if (!containerId) {
 			throw new Error('Failed to start container');
@@ -245,15 +297,27 @@ export async function applyPublishState(
 			await stopContainer(pub.container_name);
 		}
 
-		// Register a wake route pointing to vibebox itself (the app will
-		// start the container on first request in a future middleware).
-		// For now, register a route to the container port so it works when started.
+		// Register a wake route pointing to vibebox's own port so the
+		// SvelteKit handle hook can intercept and start the container on demand
 		const host = `${pub.subdomain}.${config.domain}`;
-		await upsertRoute(pub.caddy_route_id, host, pub.container_port);
+		await upsertRoute(pub.caddy_route_id, host, config.port);
 
 		pub.state = 'lazy';
 		pub.container_id = null;
 		pub.url = `https://${host}`;
+
+		// Register in lazy in-memory map for wake-on-request
+		registerLazy(pub.subdomain, {
+			vibezzzDir,
+			projectPath,
+			containerName: pub.container_name,
+			containerPort: pub.container_port,
+			image: pub.image,
+			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
+			lastRequestAt: Date.now(),
+			starting: false,
+			startPromise: null
+		});
 
 		const metaPath = join(vibezzzDir, 'meta.yaml');
 		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
@@ -262,25 +326,29 @@ export async function applyPublishState(
 			await writeYaml(metaPath, meta);
 		}
 
+		await notify('publish_succeeded', projectPath, `Published ${projectPath} (lazy)`, pub.url);
+
 	} else if (targetState === 'down') {
 		// Stop container
 		if (pub.container_id || await containerIsRunning(pub.container_name)) {
 			await stopContainer(pub.container_name);
 		}
 
-		// Remove Caddy route
+		// Remove Caddy route and lazy registry entry
 		await removeRoute(pub.caddy_route_id);
+		lazyRegistry.delete(pub.subdomain);
 
 		pub.state = 'down';
 		pub.container_id = null;
-		// Keep url as null when down
 		pub.url = null;
 
-		// Revert stage to preview_ready or building (don't regress to paused)
+		// Only revert project_stage if it was set to 'published' by the publish flow.
+		// Do NOT touch the stage if it's any other value — that would mutate
+		// unrelated preview semantics (spec: "leave preview flow untouched").
 		const metaPath = join(vibezzzDir, 'meta.yaml');
 		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
 		if (meta && meta.project_stage === 'published') {
-			meta.project_stage = 'preview_ready';
+			meta.project_stage = 'building';
 			await writeYaml(metaPath, meta);
 		}
 	}
@@ -291,7 +359,7 @@ export async function applyPublishState(
 
 /**
  * Reconcile publish state on startup: verify container still exists,
- * re-register Caddy routes for published projects.
+ * re-register Caddy routes for published projects, populate lazy registry.
  */
 export async function reconcilePublish(
 	vibezzzDir: string,
@@ -315,16 +383,206 @@ export async function reconcilePublish(
 			console.warn(`[publish] Reconcile: container ${pub.container_name} gone for ${projectPath}, marked down`);
 			return;
 		}
-		// Re-register route
+		// Re-register route pointing to container
 		if (pub.subdomain) {
 			const host = `${pub.subdomain}.${config.domain}`;
 			await upsertRoute(pub.caddy_route_id, host, pub.container_port);
 		}
 	}
 
-	if (pub.state === 'lazy' && pub.subdomain) {
-		// Re-register the wake route
+	if (pub.state === 'lazy' && pub.subdomain && pub.image) {
+		// Re-register the wake route pointing to vibebox's own port
 		const host = `${pub.subdomain}.${config.domain}`;
-		await upsertRoute(pub.caddy_route_id, host, pub.container_port);
+		await upsertRoute(pub.caddy_route_id, host, config.port);
+
+		// Re-populate the lazy registry
+		registerLazy(pub.subdomain, {
+			vibezzzDir,
+			projectPath,
+			containerName: pub.container_name,
+			containerPort: pub.container_port,
+			image: pub.image,
+			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
+			lastRequestAt: Date.now(),
+			starting: false,
+			startPromise: null
+		});
+	}
+}
+
+// ── Lazy wake-on-request ────────────────────────────────────────────
+
+function registerLazy(subdomain: string, entry: LazyEntry): void {
+	lazyRegistry.set(subdomain, entry);
+	ensureIdleTimer();
+}
+
+/**
+ * Check if a hostname matches a lazy-published project.
+ */
+export function isLazyHost(hostname: string): boolean {
+	const config = getConfig();
+	if (!hostname.endsWith(`.${config.domain}`)) return false;
+	const subdomain = hostname.slice(0, -(config.domain.length + 1));
+	return lazyRegistry.has(subdomain);
+}
+
+/**
+ * Wake a lazy container on first request.
+ * Returns the local port to proxy to, or null on failure.
+ * Serializes concurrent wake attempts for the same subdomain.
+ */
+export async function wakeAndProxy(hostname: string): Promise<number | null> {
+	const config = getConfig();
+	if (!hostname.endsWith(`.${config.domain}`)) return null;
+	const subdomain = hostname.slice(0, -(config.domain.length + 1));
+
+	const entry = lazyRegistry.get(subdomain);
+	if (!entry) return null;
+
+	// Update last-request timestamp
+	entry.lastRequestAt = Date.now();
+
+	// Persist last_request_at to deploy.yaml (best-effort, non-blocking)
+	persistLastRequest(entry).catch(() => {});
+
+	// Check if container is already running
+	const running = await containerIsRunning(entry.containerName);
+	if (running) {
+		return entry.containerPort;
+	}
+
+	// Serialize concurrent start attempts
+	if (entry.startPromise) {
+		const ok = await entry.startPromise;
+		return ok ? entry.containerPort : null;
+	}
+
+	entry.starting = true;
+	entry.startPromise = (async () => {
+		try {
+			const containerId = await startContainer(
+				entry.containerName,
+				entry.image,
+				entry.containerPort
+			);
+			if (!containerId) return false;
+
+			// Wait for the container to be healthy
+			const healthy = await waitForContainerHealthy(entry.containerPort);
+			if (!healthy) {
+				console.warn(`[publish] Lazy container ${entry.containerName} started but not healthy`);
+				await stopContainer(entry.containerName);
+				return false;
+			}
+
+			// Persist container_id
+			const deploy = await readDeployConfig(entry.vibezzzDir);
+			if (deploy?.publish) {
+				deploy.publish.container_id = containerId;
+				deploy.publish.last_request_at = new Date().toISOString();
+				await writeDeployConfig(entry.vibezzzDir, deploy);
+			}
+
+			console.log(`[publish] Lazy wake: started ${entry.containerName} for ${subdomain}`);
+			return true;
+		} catch (err) {
+			console.error(`[publish] Lazy wake failed for ${entry.containerName}: ${(err as Error).message}`);
+			return false;
+		} finally {
+			entry.starting = false;
+			entry.startPromise = null;
+		}
+	})();
+
+	const ok = await entry.startPromise;
+	return ok ? entry.containerPort : null;
+}
+
+async function persistLastRequest(entry: LazyEntry): Promise<void> {
+	const deploy = await readDeployConfig(entry.vibezzzDir);
+	if (deploy?.publish) {
+		deploy.publish.last_request_at = new Date().toISOString();
+		await writeDeployConfig(entry.vibezzzDir, deploy);
+	}
+}
+
+// ── Idle timeout cleanup ────────────────────────────────────────────
+
+function ensureIdleTimer(): void {
+	if (idleTimerHandle) return;
+	// Check every 60 seconds
+	idleTimerHandle = setInterval(() => {
+		checkIdleContainers().catch((err) => {
+			console.warn(`[publish] Idle check error: ${(err as Error).message}`);
+		});
+	}, 60_000);
+	// Don't hold the event loop open for this timer
+	if (idleTimerHandle && typeof idleTimerHandle === 'object' && 'unref' in idleTimerHandle) {
+		idleTimerHandle.unref();
+	}
+}
+
+export async function checkIdleContainers(): Promise<void> {
+	const now = Date.now();
+
+	for (const [subdomain, entry] of lazyRegistry) {
+		const idleMs = now - entry.lastRequestAt;
+		const timeoutMs = (entry.idleTimeout || 300) * 1000;
+
+		if (idleMs < timeoutMs) continue;
+
+		// Check if container is actually running before stopping
+		const running = await containerIsRunning(entry.containerName);
+		if (!running) continue;
+
+		console.log(
+			`[publish] Idle shutdown: ${entry.containerName} idle for ${Math.round(idleMs / 1000)}s (timeout: ${entry.idleTimeout}s)`
+		);
+
+		await stopContainer(entry.containerName);
+
+		// Update deploy.yaml
+		const deploy = await readDeployConfig(entry.vibezzzDir);
+		if (deploy?.publish) {
+			deploy.publish.container_id = null;
+			await writeDeployConfig(entry.vibezzzDir, deploy);
+		}
+	}
+}
+
+/**
+ * Stop the idle timer. Used for testing cleanup.
+ */
+export function stopIdleTimer(): void {
+	if (idleTimerHandle) {
+		clearInterval(idleTimerHandle);
+		idleTimerHandle = null;
+	}
+}
+
+/**
+ * Initialize lazy registry from all projects on startup.
+ * Called from reconcileOnStartup after project scan.
+ */
+export async function initLazyRegistry(): Promise<void> {
+	let projects;
+	try {
+		projects = await scanProjects();
+	} catch {
+		return;
+	}
+
+	const config = getConfig();
+
+	for (const project of projects) {
+		const absPath = join(config.projectsDir, project.path);
+		const vibezzzDir = join(absPath, '.vibezzz');
+
+		try {
+			await reconcilePublish(vibezzzDir, project.path);
+		} catch (err) {
+			console.warn(`[publish] Failed to reconcile publish for ${project.path}: ${(err as Error).message}`);
+		}
 	}
 }
