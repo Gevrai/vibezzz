@@ -900,7 +900,7 @@ describe('publish — subdomain change while published', () => {
 	it('changing subdomain while up resets state to down and clears container_id', async () => {
 		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
 		await mkdir(vibezzzDir, { recursive: true });
-		const { writeYaml } = await import('../yaml');
+		const { writeYaml, readYaml } = await import('../yaml');
 		await writeYaml(join(vibezzzDir, 'deploy.yaml'), {
 			preview: {
 				command: '', port: 3001, healthcheck_path: '/', pid: null,
@@ -920,6 +920,10 @@ describe('publish — subdomain change while published', () => {
 				caddy_route_id: 'vibebox-old-app'
 			}
 		});
+		await writeYaml(join(vibezzzDir, 'meta.yaml'), {
+			name: 'proj', category: 'cat', origin: 'brain',
+			created_at: new Date().toISOString(), project_stage: 'published'
+		});
 
 		const { updatePublishSettings } = await import('../publish');
 		const result = await updatePublishSettings(vibezzzDir, 'proj', {
@@ -932,6 +936,10 @@ describe('publish — subdomain change while published', () => {
 		expect(result.publish!.subdomain).toBe('new-app');
 		expect(result.publish!.container_name).toBe('vibebox-new-app');
 		expect(result.publish!.caddy_route_id).toBe('vibebox-new-app');
+
+		// project_stage should revert from 'published' consistently with explicit down path
+		const meta = await readYaml<Record<string, unknown>>(join(vibezzzDir, 'meta.yaml'), {});
+		expect(meta.project_stage).toBe('building');
 	});
 
 	it('changing subdomain while down does not reset state', async () => {

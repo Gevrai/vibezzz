@@ -318,13 +318,17 @@ export async function startContainer(
 	}
 }
 
-export async function stopContainer(name: string): Promise<void> {
+export async function stopContainer(name: string): Promise<boolean> {
 	try {
 		await execFileAsync(runtime(), ['stop', name], { timeout: 15_000 });
 	} catch { /* already stopped or doesn't exist */ }
 	try {
 		await execFileAsync(runtime(), ['rm', '-f', name]);
-	} catch { /* already removed */ }
+	} catch (err) {
+		console.error(`[publish] Failed to remove container ${name}: ${(err as Error).message}`);
+		return false;
+	}
+	return true;
 }
 
 async function waitForContainerHealthy(
@@ -385,6 +389,7 @@ export async function updatePublishSettings(
 	let lazyReRegistration: (() => void) | null = null;
 	let containerToStop: string | null = null;
 	let portToRelease: number | null = null;
+	let demotedFromUp = false;
 
 	if (settings.subdomain !== undefined && settings.subdomain !== deploy.publish.subdomain) {
 		// Reject if subdomain is already claimed by another project
@@ -410,6 +415,7 @@ export async function updatePublishSettings(
 			if (previousState === 'up') {
 				deploy.publish.state = 'down';
 				deploy.publish.url = null;
+				demotedFromUp = true;
 			}
 
 			// Defer route/registry cleanup until after persist
@@ -485,14 +491,24 @@ export async function updatePublishSettings(
 	// Port release is deferred until after old route removal below so
 	// a stale route never references a port given to another container.
 	if (containerToStop) {
-		await stopContainer(containerToStop);
+		const stopped = await stopContainer(containerToStop);
+		if (!stopped) {
+			deploy.publish.needs_container_stop = containerToStop;
+			await writeDeployConfig(vibezzzDir, deploy);
+			console.warn(`[publish] Container ${containerToStop} removal failed during subdomain change; persisted for reconciliation`);
+		}
 	}
 
 	// Execute deferred container stop for image/port change on lazy entry
 	if (existingLazyEntry && (imageChanged || portChanged)) {
 		const running = await containerIsRunning(existingLazyEntry.containerName);
 		if (running) {
-			await stopContainer(existingLazyEntry.containerName);
+			const stopped = await stopContainer(existingLazyEntry.containerName);
+			if (!stopped) {
+				deploy.publish.needs_container_stop = existingLazyEntry.containerName;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.warn(`[publish] Container ${existingLazyEntry.containerName} removal failed during image/port change; persisted for reconciliation`);
+			}
 		}
 
 		// Restore Caddy route to vibebox's wake endpoint so the
@@ -624,6 +640,18 @@ export async function updatePublishSettings(
 		if (settings.image !== undefined) existingLazyEntry.image = settings.image;
 		// Re-enable after syncing (was disabled during image/port change teardown)
 		if (existingLazyEntry.disabled) existingLazyEntry.disabled = false;
+	}
+
+	// When subdomain change implicitly demoted up → down, update project_stage
+	// consistently with the explicit down path.
+	if (demotedFromUp) {
+		const metaPath = join(vibezzzDir, 'meta.yaml');
+		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
+		if (meta && meta.project_stage === 'published') {
+			meta.project_stage =
+				deploy.preview?.status === 'ready' ? 'preview_ready' : 'building';
+			await writeYaml(metaPath, meta);
+		}
 	}
 
 	return deploy;
@@ -864,7 +892,12 @@ export async function applyPublishState(
 
 		// Tear down the old container now that route + persist succeeded
 		if (priorContainerId) {
-			await stopContainer(pub.container_name);
+			const stopped = await stopContainer(pub.container_name);
+			if (!stopped) {
+				pub.needs_container_stop = pub.container_name;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.warn(`[publish] Container ${pub.container_name} removal failed during lazy transition; persisted for reconciliation`);
+			}
 		}
 		releaseHostPort(priorHostPort);
 
@@ -908,7 +941,12 @@ export async function applyPublishState(
 
 		// Tear down the old container now that persist succeeded
 		if (needsContainerStop) {
-			await stopContainer(pub.container_name);
+			const stopped = await stopContainer(pub.container_name);
+			if (!stopped) {
+				pub.needs_container_stop = pub.container_name;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.warn(`[publish] Container ${pub.container_name} removal failed during down transition; persisted for reconciliation`);
+			}
 		}
 
 		// Remove route BEFORE releasing the port so a stale route can
@@ -985,6 +1023,19 @@ export async function reconcilePublish(
 		for (const [routeId, port] of Object.entries(pub.retired_route_ports)) {
 			retiredRoutePorts.set(routeId, port);
 			trackHostPort(port);
+		}
+	}
+
+	// Retry teardown of a container that failed to stop/remove previously.
+	if (pub.needs_container_stop) {
+		const containerName = pub.needs_container_stop;
+		const stopped = await stopContainer(containerName);
+		if (stopped) {
+			pub.needs_container_stop = undefined;
+			await writeDeployConfig(vibezzzDir, deploy);
+			console.log(`[publish] Reconcile: cleaned up orphaned container ${containerName} for ${projectPath}`);
+		} else {
+			console.warn(`[publish] Reconcile: orphaned container ${containerName} still cannot be removed for ${projectPath}`);
 		}
 	}
 
@@ -1467,7 +1518,11 @@ export async function checkIdleContainers(): Promise<void> {
 			}
 
 			// All checks passed — stop the container and clear metadata
-			await stopContainer(entry.containerName);
+			const stopped = await stopContainer(entry.containerName);
+			if (!stopped) {
+				deploy.publish.needs_container_stop = entry.containerName;
+				console.warn(`[publish] Container ${entry.containerName} removal failed during idle shutdown; persisted for reconciliation`);
+			}
 
 			// Revert Caddy route back to vibebox's port for wake-on-demand.
 			// Release the port only AFTER the route has been switched so a

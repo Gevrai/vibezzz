@@ -48,6 +48,8 @@ export interface DeployConfig {
 		retired_route_ports?: Record<string, number>;
 		/** Set when a mandatory wake-route restoration fails; reconcile retries. */
 		needs_wake_route?: boolean;
+		/** Set when container stop/remove fails; reconcile retries teardown. */
+		needs_container_stop?: string;
 	};
 	automation?: {
 		auto_start_agent?: boolean;
