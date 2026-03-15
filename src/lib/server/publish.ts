@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:net';
+import { realpath } from 'node:fs/promises';
 import { readDeployConfig, writeDeployConfig, type DeployConfig } from './preview.js';
 import { upsertRoute, removeRoute } from './caddy.js';
 import { getConfig } from './config.js';
@@ -127,6 +128,52 @@ function trackHostPort(port: number | null | undefined): void {
 
 export function getLazyRegistry(): ReadonlyMap<string, LazyEntry> {
 	return lazyRegistry;
+}
+
+/**
+ * Check if a subdomain is already claimed by another project.
+ * Checks both the in-memory lazy registry and persisted deploy configs.
+ */
+async function isSubdomainClaimedByOther(
+	subdomain: string,
+	currentVibezzzDir: string
+): Promise<boolean> {
+	// Fast path: check in-memory lazy registry
+	const lazyEntry = lazyRegistry.get(subdomain);
+	if (lazyEntry && lazyEntry.vibezzzDir !== currentVibezzzDir) {
+		return true;
+	}
+
+	// Full check: scan all project deploy configs on disk
+	let projects;
+	try {
+		projects = await scanProjects();
+	} catch {
+		return false;
+	}
+
+	const config = getConfig();
+	let resolvedProjectsDir: string;
+	try {
+		resolvedProjectsDir = await realpath(config.projectsDir);
+	} catch {
+		return false;
+	}
+
+	for (const project of projects) {
+		const projectVibezzzDir = join(resolvedProjectsDir, project.path, '.vibezzz');
+		if (projectVibezzzDir === currentVibezzzDir) continue;
+		try {
+			const deploy = await readDeployConfig(projectVibezzzDir);
+			if (deploy?.publish?.subdomain === subdomain) {
+				return true;
+			}
+		} catch {
+			continue;
+		}
+	}
+
+	return false;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -268,6 +315,11 @@ export async function updatePublishSettings(
 	let lazyReRegistration: (() => void) | null = null;
 
 	if (settings.subdomain !== undefined && settings.subdomain !== deploy.publish.subdomain) {
+		// Reject if subdomain is already claimed by another project
+		if (await isSubdomainClaimedByOther(settings.subdomain, vibezzzDir)) {
+			throw new Error(`Subdomain '${settings.subdomain}' is already claimed by another project`);
+		}
+
 		const oldSubdomain = deploy.publish.subdomain;
 		const oldRouteId = deploy.publish.caddy_route_id;
 		const oldContainerName = deploy.publish.container_name;
@@ -350,9 +402,14 @@ export async function updatePublishSettings(
 
 	// Disable old lazy entry before removal so in-flight wakeAndProxy()
 	// calls on the old subdomain abort instead of persisting stale metadata.
+	// Save the entry for potential rollback if new route registration fails.
+	let savedOldLazyEntry: LazyEntry | undefined;
 	if (oldSubdomainToDelete) {
 		const oldEntry = lazyRegistry.get(oldSubdomainToDelete);
-		if (oldEntry) oldEntry.disabled = true;
+		if (oldEntry) {
+			savedOldLazyEntry = { ...oldEntry, starting: false, startPromise: null };
+			oldEntry.disabled = true;
+		}
 	}
 
 	if (oldRouteToRemove) await removeRoute(oldRouteToRemove);
@@ -370,6 +427,17 @@ export async function updatePublishSettings(
 			deploy.publish.caddy_route_id = `vibebox-${oldSubdomainToDelete}`;
 			deploy.publish.url = deploy.publish.state === 'lazy' ? `https://${oldSubdomainToDelete}.${config.domain}` : deploy.publish.url;
 			await writeDeployConfig(vibezzzDir, deploy);
+
+			// Restore old Caddy route (best-effort)
+			const oldHost = `${oldSubdomainToDelete}.${config.domain}`;
+			await upsertRoute(deploy.publish.caddy_route_id, oldHost, config.port);
+
+			// Restore old lazy registry entry so the project remains reachable
+			if (savedOldLazyEntry) {
+				savedOldLazyEntry.disabled = false;
+				registerLazy(oldSubdomainToDelete!, savedOldLazyEntry);
+			}
+
 			throw new Error(`Failed to register Caddy route for new subdomain ${settings.subdomain}`);
 		}
 		lazyReRegistration();
@@ -427,6 +495,9 @@ export async function applyPublishState(
 		}
 		if (!pub.subdomain) {
 			throw new Error('Cannot publish: no subdomain configured');
+		}
+		if (await isSubdomainClaimedByOther(pub.subdomain, vibezzzDir)) {
+			throw new Error(`Cannot publish: subdomain '${pub.subdomain}' is already claimed by another project`);
 		}
 
 		// Save lazy entry so we can restore it if the transition fails
@@ -491,6 +562,9 @@ export async function applyPublishState(
 		}
 		if (!pub.subdomain) {
 			throw new Error('Cannot set lazy publish: no subdomain configured');
+		}
+		if (await isSubdomainClaimedByOther(pub.subdomain, vibezzzDir)) {
+			throw new Error(`Cannot set lazy publish: subdomain '${pub.subdomain}' is already claimed by another project`);
 		}
 
 		// Stop container if running (lazy starts on demand)
