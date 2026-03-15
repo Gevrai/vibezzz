@@ -207,7 +207,28 @@ export async function updatePublishSettings(
 	}
 
 	if (settings.image !== undefined) deploy.publish.image = settings.image;
-	if (settings.subdomain !== undefined) {
+	if (settings.subdomain !== undefined && settings.subdomain !== deploy.publish.subdomain) {
+		const oldSubdomain = deploy.publish.subdomain;
+		const oldRouteId = deploy.publish.caddy_route_id;
+		const oldContainerName = deploy.publish.container_name;
+
+		// Clean up stale routing/registry from the old subdomain when already published
+		if (deploy.publish.state !== 'down') {
+			await removeRoute(oldRouteId);
+			lazyRegistry.delete(oldSubdomain);
+
+			// Stop old container if state is 'up' and container name is changing
+			if (deploy.publish.state === 'up' && deploy.publish.container_id) {
+				await stopContainer(oldContainerName);
+				deploy.publish.container_id = null;
+				deploy.publish.state = 'down';
+				deploy.publish.url = null;
+			} else if (deploy.publish.state === 'lazy') {
+				deploy.publish.state = 'down';
+				deploy.publish.url = null;
+			}
+		}
+
 		deploy.publish.subdomain = settings.subdomain;
 		deploy.publish.container_name = `vibebox-${settings.subdomain}`;
 		deploy.publish.caddy_route_id = `vibebox-${settings.subdomain}`;
@@ -391,9 +412,24 @@ export async function reconcilePublish(
 	}
 
 	if (pub.state === 'lazy' && pub.subdomain && pub.image) {
+		// Clear stale container metadata (mirrors the 'up' reconciliation path)
+		if (pub.container_id) {
+			const running = await containerIsRunning(pub.container_name);
+			if (!running) {
+				pub.container_id = null;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.warn(`[publish] Reconcile: stale container_id cleared for lazy project ${projectPath}`);
+			}
+		}
+
 		// Re-register the wake route pointing to vibebox's own port
 		const host = `${pub.subdomain}.${config.domain}`;
 		await upsertRoute(pub.caddy_route_id, host, config.port);
+
+		// Reuse persisted last_request_at so idle shutdown remains restart-stable
+		const restoredLastRequest = pub.last_request_at
+			? new Date(pub.last_request_at).getTime()
+			: Date.now();
 
 		// Re-populate the lazy registry
 		registerLazy(pub.subdomain, {
@@ -403,7 +439,7 @@ export async function reconcilePublish(
 			containerPort: pub.container_port,
 			image: pub.image,
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
-			lastRequestAt: Date.now(),
+			lastRequestAt: restoredLastRequest,
 			starting: false,
 			startPromise: null
 		});
