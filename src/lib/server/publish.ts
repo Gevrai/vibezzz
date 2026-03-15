@@ -908,6 +908,35 @@ export async function applyPublishState(
 				// vibebox while the project remains persisted as down.
 				const removed = await removeRoute(pub.caddy_route_id);
 				if (!removed) {
+					// Persist retired-route metadata so reconcilePublish() can
+					// retry removal of the orphaned wake route.
+					if (!pub.retired_routes) pub.retired_routes = [];
+					if (!pub.retired_routes.includes(pub.caddy_route_id)) {
+						pub.retired_routes.push(pub.caddy_route_id);
+					}
+					try {
+						await writeDeployConfig(vibezzzDir, deploy);
+						// Re-register a disabled sentinel so isLazyHost()
+						// intercepts requests while the stale route exists.
+						lazyRegistry.set(pub.subdomain, {
+							vibezzzDir,
+							projectPath,
+							containerName: '',
+							containerPort: 0,
+							hostPort: null,
+							image: '',
+							idleTimeout: 0,
+							lastRequestAt: 0,
+							starting: false,
+							startPromise: null,
+							disabled: true
+						});
+					} catch {
+						// Best-effort — original persist already failed so
+						// this may too.  Clean up in-memory metadata.
+						pub.retired_routes = pub.retired_routes.filter(r => r !== pub.caddy_route_id);
+						if (pub.retired_routes.length === 0) pub.retired_routes = undefined;
+					}
 					console.error(`[publish] CRITICAL: Failed to remove orphaned wake route ${pub.caddy_route_id} during lazy rollback — stale route may persist until next reconciliation`);
 				}
 			}
