@@ -44,6 +44,8 @@ export interface DeployConfig {
 		caddy_route_id: string;
 		/** Caddy route IDs that failed to remove; reconcile retries cleanup. */
 		retired_routes?: string[];
+		/** Maps retired route ID → host port so reserved ports survive restart. */
+		retired_route_ports?: Record<string, number>;
 		/** Set when a mandatory wake-route restoration fails; reconcile retries. */
 		needs_wake_route?: boolean;
 	};
