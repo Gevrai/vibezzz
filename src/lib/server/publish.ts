@@ -593,8 +593,9 @@ export async function applyPublishState(
 			releaseHostPort(hostPort);
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
+				// Restore wake route only when rolling back to a prior lazy state
+				await upsertRoute(pub.caddy_route_id, host, config.port);
 			}
-			await upsertRoute(pub.caddy_route_id, host, config.port);
 			throw new Error('Failed to start container');
 		}
 
@@ -612,8 +613,9 @@ export async function applyPublishState(
 			releaseHostPort(hostPort);
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
+				// Restore wake route only when rolling back to a prior lazy state
+				await upsertRoute(pub.caddy_route_id, host, config.port);
 			}
-			await upsertRoute(pub.caddy_route_id, host, config.port);
 			throw err;
 		}
 
@@ -629,11 +631,12 @@ export async function applyPublishState(
 				// Restore to prior lazy state, not down
 				pub.state = 'lazy';
 				savedLazyEntry.disabled = false;
+				// Restore wake route only when rolling back to a prior lazy state
+				await upsertRoute(pub.caddy_route_id, host, config.port);
 			} else {
 				pub.state = 'down';
 				pub.url = null;
 			}
-			await upsertRoute(pub.caddy_route_id, host, config.port);
 			await writeDeployConfig(vibezzzDir, deploy);
 			throw new Error(`Failed to register Caddy route for ${host}`);
 		}
@@ -672,12 +675,32 @@ export async function applyPublishState(
 
 		const host = `${pub.subdomain}.${config.domain}`;
 
+		// Register the lazy entry BEFORE switching the Caddy route so
+		// isLazyHost() returns true as soon as traffic arrives at vibebox,
+		// preventing requests from falling through to the main app during
+		// the transition window.  Use priorHostPort so wakeAndProxy()
+		// short-circuits to the still-running container if a request
+		// arrives before teardown.
+		registerLazy(pub.subdomain, {
+			vibezzzDir,
+			projectPath,
+			containerName: pub.container_name,
+			containerPort: pub.container_port,
+			hostPort: priorHostPort ?? null,
+			image: pub.image!,
+			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
+			lastRequestAt: Date.now(),
+			starting: false,
+			startPromise: null,
+			disabled: false
+		});
+
 		// Install the Caddy wake route BEFORE tearing down the live
 		// container so a Caddy failure cannot take a working app offline.
 		const routeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
 		if (!routeOk) {
-			// Route failed — prior container (if any) is still running.
-			// Defensively restore the direct route in case Caddy cleared it.
+			// Route failed — undo lazy registration and restore direct route
+			lazyRegistry.delete(pub.subdomain);
 			if (priorHostPort) {
 				await upsertRoute(pub.caddy_route_id, host, priorHostPort);
 			}
@@ -694,7 +717,8 @@ export async function applyPublishState(
 		try {
 			await writeDeployConfig(vibezzzDir, deploy);
 		} catch (err) {
-			// Restore prior state and direct Caddy route
+			// Restore prior state, undo lazy registration, restore direct route
+			lazyRegistry.delete(pub.subdomain);
 			pub.state = priorState;
 			pub.container_id = priorContainerId;
 			pub.host_port = priorHostPort;
@@ -711,13 +735,15 @@ export async function applyPublishState(
 		}
 		releaseHostPort(priorHostPort);
 
+		// Update the lazy entry to its final state (no host port now that
+		// the container is stopped); overwrites the transitional entry above.
 		registerLazy(pub.subdomain, {
 			vibezzzDir,
 			projectPath,
 			containerName: pub.container_name,
 			containerPort: pub.container_port,
 			hostPort: null,
-			image: pub.image,
+			image: pub.image!,
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
 			lastRequestAt: Date.now(),
 			starting: false,
