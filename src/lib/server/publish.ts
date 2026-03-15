@@ -515,7 +515,9 @@ export async function updatePublishSettings(
 			const oldHost = `${oldSubdomainToDelete}.${config.domain}`;
 			const oldRouteOk = await upsertRoute(deploy.publish.caddy_route_id, oldHost, config.port);
 			if (!oldRouteOk) {
-				console.error(`[publish] CRITICAL: Failed to restore old wake route for ${oldHost} during rollback — hostname unreachable until next reconcile`);
+				deploy.publish.needs_wake_route = true;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.error(`[publish] CRITICAL: Failed to restore old wake route for ${oldHost} during rollback — persisted for reconciliation`);
 			}
 
 			// Restore old lazy registry entry so the project remains reachable
@@ -607,7 +609,12 @@ export async function applyPublishState(
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
 				// Restore wake route only when rolling back to a prior lazy state
-				await upsertRoute(pub.caddy_route_id, host, config.port);
+				const wakeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
+				if (!wakeOk) {
+					pub.needs_wake_route = true;
+					await writeDeployConfig(vibezzzDir, deploy);
+					console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} during container-start rollback — persisted for reconciliation`);
+				}
 			}
 			throw new Error('Failed to start container');
 		}
@@ -627,7 +634,18 @@ export async function applyPublishState(
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
 				// Restore wake route only when rolling back to a prior lazy state
-				await upsertRoute(pub.caddy_route_id, host, config.port);
+				const wakeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
+				if (!wakeOk) {
+					// Best-effort: re-read on-disk state (still 'lazy') to persist the flag
+					try {
+						const onDisk = await readDeployConfig(vibezzzDir);
+						if (onDisk?.publish) {
+							onDisk.publish.needs_wake_route = true;
+							await writeDeployConfig(vibezzzDir, onDisk);
+						}
+					} catch { /* write may still fail — reconcile on restart */ }
+					console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} during persist rollback — persisted for reconciliation`);
+				}
 			}
 			throw err;
 		}
@@ -645,7 +663,11 @@ export async function applyPublishState(
 				pub.state = 'lazy';
 				savedLazyEntry.disabled = false;
 				// Restore wake route only when rolling back to a prior lazy state
-				await upsertRoute(pub.caddy_route_id, host, config.port);
+				const wakeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
+				if (!wakeOk) {
+					pub.needs_wake_route = true;
+					console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} during route rollback — persisted for reconciliation`);
+				}
 			} else {
 				pub.state = 'down';
 				pub.url = null;
@@ -897,7 +919,20 @@ export async function reconcilePublish(
 
 		// Re-register the wake route pointing to vibebox's own port
 		const host = `${pub.subdomain}.${config.domain}`;
-		await upsertRoute(pub.caddy_route_id, host, config.port);
+		const routeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
+		if (routeOk) {
+			if (pub.needs_wake_route) {
+				pub.needs_wake_route = undefined;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.log(`[publish] Reconcile: restored pending wake route for ${projectPath}`);
+			}
+		} else {
+			if (!pub.needs_wake_route) {
+				pub.needs_wake_route = true;
+				await writeDeployConfig(vibezzzDir, deploy);
+			}
+			console.warn(`[publish] Reconcile: wake route restoration still failing for ${projectPath}`);
+		}
 
 		// Reuse persisted last_request_at so idle shutdown remains restart-stable
 		const restoredLastRequest = pub.last_request_at
@@ -1082,7 +1117,16 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 					const host = `${subdomain}.${config.domain}`;
 					const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
 					if (!routeOk) {
-						console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — hostname unreachable until next reconcile`);
+						try {
+							await withDeployLock(entry.vibezzzDir, async () => {
+								const d = await readDeployConfig(entry.vibezzzDir);
+								if (d?.publish && d.publish.state === 'lazy' && d.publish.subdomain === subdomain) {
+									d.publish.needs_wake_route = true;
+									await writeDeployConfig(entry.vibezzzDir, d);
+								}
+							});
+						} catch { /* best-effort persist */ }
+						console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — persisted for reconciliation`);
 					}
 				} else {
 					console.log(`[publish] Wake rollback: skipping route restore for ${subdomain} — publish state no longer lazy for this subdomain`);
@@ -1183,7 +1227,8 @@ export async function checkIdleContainers(): Promise<void> {
 			const host = `${subdomain}.${config.domain}`;
 			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
 			if (!routeOk) {
-				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after idle shutdown — hostname unreachable until next reconcile`);
+				deploy.publish.needs_wake_route = true;
+				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after idle shutdown — persisted for reconciliation`);
 			}
 
 			deploy.publish.container_id = null;
