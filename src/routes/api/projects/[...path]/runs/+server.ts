@@ -39,7 +39,16 @@ async function resolveProject(path: string) {
 export const GET: RequestHandler = async ({ params }) => {
 	const { vibezzzDir } = await resolveProject(params.path);
 	const runs = await getRunHistory(vibezzzDir);
-	return json(runs);
+
+	// Add log_url to each entry that has a log_path
+	const runsWithLogUrls = runs.map((run) => ({
+		...run,
+		log_url: run.log_path
+			? `/api/projects/${encodeURIComponent(params.path)}/runs/${run.id}/logs`
+			: null
+	}));
+
+	return json(runsWithLogUrls);
 };
 
 export const POST: RequestHandler = async ({ params, request }) => {

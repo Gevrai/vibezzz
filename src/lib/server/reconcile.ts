@@ -6,13 +6,18 @@
  *   - the PID no longer exists
  *   - the process start time doesn't match
  *   - the process doesn't belong to the expected working directory
+ *
+ * Also rehydrates live previews into the in-memory map so the monitor
+ * and live UI surfaces work immediately after restart.
  */
 
 import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { readYaml, writeYaml } from './yaml.js';
 import { scanProjects } from './projects.js';
 import { getConfig } from './config.js';
 import { upsertRoute } from './caddy.js';
+import { checkPreviewHealth, rehydratePreview } from './preview.js';
 import type { AgentRunEntry } from './agents.js';
 import type { DeployConfig } from './preview.js';
 
@@ -36,7 +41,7 @@ function isPidAlive(pid: number): boolean {
  */
 async function getProcessStartTime(pid: number): Promise<number | null> {
 	try {
-		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		const stat = await readFile(`/proc/${pid}/stat`, 'utf-8');
 		const parts = stat.split(') ');
 		if (parts.length < 2) return null;
 		const fields = parts[1].split(' ');
@@ -45,6 +50,71 @@ async function getProcessStartTime(pid: number): Promise<number | null> {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Read the working directory of a process from /proc on Linux.
+ * Returns the cwd path, or null if unavailable.
+ */
+async function getProcessCwd(pid: number): Promise<string | null> {
+	try {
+		const cwd = await readFile(`/proc/${pid}/cwd`, 'utf-8').catch(async () => {
+			// /proc/PID/cwd is a symlink — read it via readlink
+			const { readlink } = await import('node:fs/promises');
+			return readlink(`/proc/${pid}/cwd`);
+		});
+		return cwd || null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Validate that a running process actually belongs to the expected run.
+ * Checks start time proximity and working directory.
+ */
+async function isProcessValid(
+	pid: number,
+	expectedStartedAt: string | null,
+	expectedCwd: string | null
+): Promise<boolean> {
+	if (!isPidAlive(pid)) return false;
+
+	// Verify working directory if we have an expected cwd
+	if (expectedCwd) {
+		const actualCwd = await getProcessCwd(pid);
+		if (actualCwd && actualCwd !== expectedCwd) {
+			return false;
+		}
+	}
+
+	// Verify start time proximity if we have an expected start time
+	if (expectedStartedAt) {
+		const startTicks = await getProcessStartTime(pid);
+		if (startTicks !== null) {
+			// We can't perfectly correlate ISO timestamps with clock ticks,
+			// but we can detect obvious PID reuse: if the process start time
+			// is vastly different from when we recorded it, the PID was reused.
+			// Use a boot-time-based approach to convert ticks to epoch seconds.
+			try {
+				const uptime = await readFile('/proc/uptime', 'utf-8');
+				const uptimeSec = parseFloat(uptime.split(' ')[0]);
+				const bootEpoch = Date.now() / 1000 - uptimeSec;
+				const clkTck = 100; // standard Linux value
+				const procStartEpoch = bootEpoch + startTicks / clkTck;
+				const expectedEpoch = new Date(expectedStartedAt).getTime() / 1000;
+				// Allow 30 seconds of skew between our recorded time and the
+				// kernel-reported process start time
+				if (Math.abs(procStartEpoch - expectedEpoch) > 30) {
+					return false;
+				}
+			} catch {
+				// Can't verify — assume valid if PID is alive
+			}
+		}
+	}
+
+	return true;
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -83,7 +153,11 @@ export async function reconcileOnStartup(): Promise<void> {
 
 				let alive = false;
 				if (agent.pid) {
-					alive = isPidAlive(agent.pid);
+					alive = await isProcessValid(
+						agent.pid,
+						agent.process_started_at,
+						agent.cwd
+					);
 				}
 
 				if (!alive) {
@@ -112,7 +186,11 @@ export async function reconcileOnStartup(): Promise<void> {
 					preview.pid &&
 					(preview.status === 'starting' || preview.status === 'ready')
 				) {
-					const alive = isPidAlive(preview.pid);
+					const alive = await isProcessValid(
+						preview.pid,
+						preview.process_started_at,
+						null
+					);
 					if (!alive) {
 						preview.status = 'stopped';
 						preview.pid = null;
@@ -124,11 +202,32 @@ export async function reconcileOnStartup(): Promise<void> {
 							`[reconcile] Cleared stale preview for project: ${project.path}`
 						);
 					} else {
-						// Preview is still alive — re-register its Caddy route
-						if (preview.public && preview.subdomain && preview.status === 'ready') {
-							const host = `${preview.subdomain}.${config.domain}`;
-							const routeId = `vibebox-preview-${preview.subdomain}`;
-							await upsertRoute(routeId, host, preview.port);
+						// Preview is still alive — verify via healthcheck
+						const healthy = preview.status === 'ready'
+							? await checkPreviewHealth(preview.port, preview.healthcheck_path)
+							: true; // 'starting' previews might not be healthy yet
+
+						if (healthy || preview.status === 'starting') {
+							// Re-register Caddy route for public ready previews
+							if (preview.public && preview.subdomain && preview.status === 'ready') {
+								const host = `${preview.subdomain}.${config.domain}`;
+								const routeId = `vibebox-preview-${preview.subdomain}`;
+								await upsertRoute(routeId, host, preview.port);
+							}
+
+							// Rehydrate into in-memory map for live UI/monitoring
+							rehydratePreview(project.path, preview);
+							console.log(
+								`[reconcile] Rehydrated active preview for project: ${project.path}`
+							);
+						} else {
+							// Process alive but not healthy — mark failed
+							preview.status = 'failed';
+							await writeYaml(deployPath, deploy);
+							reconciled++;
+							console.log(
+								`[reconcile] Preview process alive but unhealthy for project: ${project.path}`
+							);
 						}
 					}
 				}

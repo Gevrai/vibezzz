@@ -67,6 +67,22 @@ export function getAllActivePreviews(): ActivePreview[] {
 	return [...activePreviews.values()];
 }
 
+/**
+ * Rehydrate a preview into the in-memory active map after restart.
+ * Used by reconciliation to restore live monitoring state for previews
+ * whose process survived the restart.
+ */
+export function rehydratePreview(projectPath: string, config: PreviewConfig): void {
+	// Only rehydrate if not already tracked (avoid overwriting a live process ref)
+	if (activePreviews.has(projectPath)) return;
+
+	activePreviews.set(projectPath, {
+		projectPath,
+		config: { ...config },
+		process: null // we don't have a ChildProcess handle after restart
+	});
+}
+
 // ── Deploy YAML helpers ──────────────────────────────────────────────
 
 function deployPath(vibezzzDir: string): string {
@@ -151,6 +167,7 @@ export async function checkPreviewHealth(port: number, healthPath: string): Prom
 
 /**
  * Start (or restart) the preview process for a project.
+ * Waits for the healthcheck to complete before returning.
  */
 export async function startPreview(
 	projectPath: string,
@@ -211,59 +228,6 @@ export async function startPreview(
 		status: 'starting'
 	});
 
-	// Wait for healthcheck in background
-	(async () => {
-		const healthy = await waitForHealthy(
-			preview.port,
-			preview.healthcheck_path
-		);
-
-		if (healthy) {
-			const previewUrl = preview.public
-				? `https://${preview.subdomain}.${config.domain}`
-				: null;
-
-			await updatePreviewConfig(vibezzzDir, {
-				status: 'ready',
-				url: previewUrl,
-				last_ready_at: new Date().toISOString()
-			});
-
-			active.config.status = 'ready';
-			active.config.url = previewUrl;
-
-			// Update meta.yaml stage
-			const metaPath = join(vibezzzDir, 'meta.yaml');
-			const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
-			if (meta) {
-				meta.project_stage = 'preview_ready';
-				meta.last_ready_at = new Date().toISOString();
-				await writeYaml(metaPath, meta);
-			}
-
-			// Register Caddy route for public previews
-			if (preview.public && preview.subdomain) {
-				const host = `${preview.subdomain}.${config.domain}`;
-				const routeId = `vibebox-preview-${preview.subdomain}`;
-				await upsertRoute(routeId, host, preview.port);
-			}
-
-			// Notify if configured
-			const automation = deploy.automation;
-			if (automation?.auto_notify_on_ready) {
-				await notify(
-					'preview_ready',
-					projectPath,
-					`Preview ready for ${projectPath}`,
-					previewUrl ?? undefined
-				);
-			}
-		} else {
-			await updatePreviewConfig(vibezzzDir, { status: 'failed' });
-			active.config.status = 'failed';
-		}
-	})();
-
 	// Handle process exit
 	proc.on('exit', async () => {
 		const current = activePreviews.get(projectPath);
@@ -277,12 +241,72 @@ export async function startPreview(
 		}
 	});
 
-	return {
-		...preview,
-		pid: proc.pid ?? null,
-		process_started_at: startedAt,
-		status: 'starting'
-	};
+	// Wait for healthcheck to complete before returning
+	const healthy = await waitForHealthy(
+		preview.port,
+		preview.healthcheck_path
+	);
+
+	if (healthy) {
+		const previewUrl = preview.public
+			? `https://${preview.subdomain}.${config.domain}`
+			: null;
+
+		await updatePreviewConfig(vibezzzDir, {
+			status: 'ready',
+			url: previewUrl,
+			last_ready_at: new Date().toISOString()
+		});
+
+		active.config.status = 'ready';
+		active.config.url = previewUrl;
+
+		// Update meta.yaml stage
+		const metaPath = join(vibezzzDir, 'meta.yaml');
+		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
+		if (meta) {
+			meta.project_stage = 'preview_ready';
+			meta.last_ready_at = new Date().toISOString();
+			await writeYaml(metaPath, meta);
+		}
+
+		// Register Caddy route for public previews
+		if (preview.public && preview.subdomain) {
+			const host = `${preview.subdomain}.${config.domain}`;
+			const routeId = `vibebox-preview-${preview.subdomain}`;
+			await upsertRoute(routeId, host, preview.port);
+		}
+
+		// Notify if configured
+		const automation = deploy.automation;
+		if (automation?.auto_notify_on_ready) {
+			await notify(
+				'preview_ready',
+				projectPath,
+				`Preview ready for ${projectPath}`,
+				previewUrl ?? undefined
+			);
+		}
+
+		return {
+			...preview,
+			pid: proc.pid ?? null,
+			process_started_at: startedAt,
+			status: 'ready',
+			url: previewUrl,
+			last_ready_at: new Date().toISOString()
+		};
+	} else {
+		await updatePreviewConfig(vibezzzDir, { status: 'failed' });
+		active.config.status = 'failed';
+
+		return {
+			...preview,
+			pid: proc.pid ?? null,
+			process_started_at: startedAt,
+			status: 'failed'
+		};
+	}
 }
 
 /**

@@ -204,7 +204,7 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 		idea_id: opts.ideaId ?? null,
 		log_path: logPath,
 		exit_code: null,
-		branch: 'main',
+		branch: handle.branch,
 		commit_sha: null,
 		result: null,
 		preview_url: null
@@ -237,6 +237,7 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 				currentEntries[idx].finished_at = result.finishedAt;
 				currentEntries[idx].exit_code = result.exitCode;
 				currentEntries[idx].result = result.result;
+				currentEntries[idx].commit_sha = result.commitSha;
 				await writeAgentsYaml(opts.vibezzzDir, currentEntries);
 			}
 
@@ -245,6 +246,7 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 			entry.finished_at = result.finishedAt;
 			entry.exit_code = result.exitCode;
 			entry.result = result.result;
+			entry.commit_sha = result.commitSha;
 
 			// Handle automation: auto-preview and notifications
 			const deployYaml = await readYaml<{ automation?: { auto_start_preview?: boolean; auto_notify_on_ready?: boolean } } | null>(
@@ -253,12 +255,17 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 			);
 			const automation = deployYaml?.automation;
 
-			if (result.result === 'ready_for_test' && automation?.auto_notify_on_ready) {
-				await notify(
-					'run_completed',
-					opts.projectPath,
-					`Agent run completed successfully for ${opts.projectPath}`
-				);
+			// Spec: run completes with ready_for_test + auto_start_preview
+			// → start preview (preview.ts handles auto_notify_on_ready)
+			if (result.result === 'ready_for_test' && automation?.auto_start_preview) {
+				try {
+					const { startPreview } = await import('./preview.js');
+					await startPreview(opts.projectPath, opts.projectAbsPath, opts.vibezzzDir);
+				} catch (err) {
+					console.warn(
+						`[agents] auto_start_preview failed for ${opts.projectPath}: ${(err as Error).message}`
+					);
+				}
 			}
 
 			if (result.result === 'failed') {
