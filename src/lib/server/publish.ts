@@ -465,6 +465,9 @@ export async function updatePublishSettings(
 			const host = `${deploy.publish.subdomain}.${config.domain}`;
 			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
 			if (!routeOk) {
+				deploy.publish.needs_wake_route = true;
+				await writeDeployConfig(vibezzzDir, deploy);
+				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after image/port change — persisted for reconciliation`);
 				throw new Error(`Failed to restore wake route for ${host} after image/port change — hostname unreachable`);
 			}
 		}
@@ -873,22 +876,51 @@ export async function reconcilePublish(
 	const config = getConfig();
 
 	// Retry cleanup of any retired routes that failed to remove previously.
-	// Skip the currently active caddy_route_id — a rename may have recycled
-	// an old route ID back into active use.
 	if (pub.retired_routes && pub.retired_routes.length > 0) {
 		const remaining: string[] = [];
 		for (const routeId of pub.retired_routes) {
-			if (routeId === pub.caddy_route_id) continue;
+			// Skip only if the route is actively serving traffic — a rename
+			// may have recycled an old ID.  When state is 'down' the route
+			// is orphaned and should still be retried for removal.
+			if (routeId === pub.caddy_route_id && pub.state !== 'down') continue;
 			const removed = await removeRoute(routeId);
 			if (!removed) {
 				remaining.push(routeId);
 				console.warn(`[publish] Reconcile: retired route ${routeId} still could not be removed for ${projectPath}`);
 			} else {
 				console.log(`[publish] Reconcile: cleaned up retired route ${routeId} for ${projectPath}`);
+				// Clean up any sentinel left by a previous reconciliation
+				const staleSubdomain = routeId.replace(/^vibebox-/, '');
+				const existingSentinel = lazyRegistry.get(staleSubdomain);
+				if (existingSentinel?.disabled) {
+					lazyRegistry.delete(staleSubdomain);
+				}
 			}
 		}
 		pub.retired_routes = remaining.length > 0 ? remaining : undefined;
 		await writeDeployConfig(vibezzzDir, deploy);
+
+		// Register disabled sentinels for retired routes still present in
+		// Caddy so isLazyHost() intercepts requests and wakeAndProxy()
+		// returns null (503), preventing fall-through to the main app.
+		for (const routeId of remaining) {
+			const staleSubdomain = routeId.replace(/^vibebox-/, '');
+			if (staleSubdomain && !lazyRegistry.has(staleSubdomain)) {
+				lazyRegistry.set(staleSubdomain, {
+					vibezzzDir,
+					projectPath,
+					containerName: '',
+					containerPort: 0,
+					hostPort: null,
+					image: '',
+					idleTimeout: 0,
+					lastRequestAt: 0,
+					starting: false,
+					startPromise: null,
+					disabled: true
+				});
+			}
+		}
 	}
 
 	if (pub.state === 'up' && pub.container_id) {
