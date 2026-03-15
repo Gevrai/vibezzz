@@ -902,6 +902,14 @@ export async function applyPublishState(
 			pub.url = priorUrl;
 			if (priorHostPort) {
 				await upsertRoute(pub.caddy_route_id, host, priorHostPort);
+			} else {
+				// No prior route existed (project was down) — remove the
+				// orphaned wake route so the subdomain doesn't point at
+				// vibebox while the project remains persisted as down.
+				const removed = await removeRoute(pub.caddy_route_id);
+				if (!removed) {
+					console.error(`[publish] CRITICAL: Failed to remove orphaned wake route ${pub.caddy_route_id} during lazy rollback — stale route may persist until next reconciliation`);
+				}
 			}
 			throw err;
 		}
