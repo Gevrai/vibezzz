@@ -482,7 +482,18 @@ export async function updatePublishSettings(
 		}
 	}
 
-	if (oldRouteToRemove) await removeRoute(oldRouteToRemove);
+	if (oldRouteToRemove) {
+		const removed = await removeRoute(oldRouteToRemove);
+		if (!removed) {
+			// Persist the retired route ID so reconciliation can retry cleanup
+			if (!deploy.publish.retired_routes) deploy.publish.retired_routes = [];
+			if (!deploy.publish.retired_routes.includes(oldRouteToRemove)) {
+				deploy.publish.retired_routes.push(oldRouteToRemove);
+			}
+			await writeDeployConfig(vibezzzDir, deploy);
+			console.warn(`[publish] Old route ${oldRouteToRemove} removal failed during rename; persisted for reconciliation cleanup`);
+		}
+	}
 	if (oldSubdomainToDelete) lazyRegistry.delete(oldSubdomainToDelete);
 	if (lazyReRegistration) {
 		const config = getConfig();
@@ -782,7 +793,13 @@ export async function applyPublishState(
 		// Live side-effects: Caddy route removal + lazy registry cleanup + meta
 		const routeOk = await removeRoute(pub.caddy_route_id);
 		if (!routeOk) {
-			console.warn(`[publish] Caddy route removal failed for ${pub.caddy_route_id}, route may be stale`);
+			// Persist the retired route ID so reconciliation can retry cleanup
+			if (!pub.retired_routes) pub.retired_routes = [];
+			if (!pub.retired_routes.includes(pub.caddy_route_id)) {
+				pub.retired_routes.push(pub.caddy_route_id);
+			}
+			await writeDeployConfig(vibezzzDir, deploy);
+			console.warn(`[publish] Caddy route removal failed for ${pub.caddy_route_id}; persisted for reconciliation cleanup`);
 		}
 		lazyRegistry.delete(pub.subdomain);
 
@@ -817,6 +834,22 @@ export async function reconcilePublish(
 
 	const pub = deploy.publish;
 	const config = getConfig();
+
+	// Retry cleanup of any retired routes that failed to remove previously
+	if (pub.retired_routes && pub.retired_routes.length > 0) {
+		const remaining: string[] = [];
+		for (const routeId of pub.retired_routes) {
+			const removed = await removeRoute(routeId);
+			if (!removed) {
+				remaining.push(routeId);
+				console.warn(`[publish] Reconcile: retired route ${routeId} still could not be removed for ${projectPath}`);
+			} else {
+				console.log(`[publish] Reconcile: cleaned up retired route ${routeId} for ${projectPath}`);
+			}
+		}
+		pub.retired_routes = remaining.length > 0 ? remaining : undefined;
+		await writeDeployConfig(vibezzzDir, deploy);
+	}
 
 	if (pub.state === 'up' && pub.container_id) {
 		const running = await containerIsRunning(pub.container_name);
@@ -1028,12 +1061,22 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
 
-				// Restore Caddy route to vibebox's wake endpoint so the
-				// hostname remains reachable for subsequent wake attempts.
-				const host = `${subdomain}.${config.domain}`;
-				const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
-				if (!routeOk) {
-					console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — hostname unreachable until next reconcile`);
+				// Re-read persisted state before restoring the wake route.
+				// A concurrent rename or unpublish may have retired this
+				// subdomain; blindly restoring would recreate a stale hostname.
+				const currentDeploy = await readDeployConfig(entry.vibezzzDir);
+				if (
+					currentDeploy?.publish &&
+					currentDeploy.publish.state === 'lazy' &&
+					currentDeploy.publish.subdomain === subdomain
+				) {
+					const host = `${subdomain}.${config.domain}`;
+					const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
+					if (!routeOk) {
+						console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — hostname unreachable until next reconcile`);
+					}
+				} else {
+					console.log(`[publish] Wake rollback: skipping route restore for ${subdomain} — publish state no longer lazy for this subdomain`);
 				}
 				return null;
 			}

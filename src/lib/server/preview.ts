@@ -42,6 +42,8 @@ export interface DeployConfig {
 		idle_timeout: number;
 		last_request_at: string | null;
 		caddy_route_id: string;
+		/** Caddy route IDs that failed to remove; reconcile retries cleanup. */
+		retired_routes?: string[];
 	};
 	automation?: {
 		auto_start_agent?: boolean;
