@@ -236,6 +236,16 @@ export async function updatePublishSettings(
 	if (settings.container_port !== undefined) deploy.publish.container_port = settings.container_port;
 	if (settings.idle_timeout !== undefined) deploy.publish.idle_timeout = settings.idle_timeout;
 
+	// Sync updated settings to the in-memory lazy registry so wakeAndProxy() uses fresh values
+	const lazyEntry = lazyRegistry.get(deploy.publish.subdomain);
+	if (lazyEntry) {
+		const config = getConfig();
+		if (settings.container_port !== undefined) lazyEntry.containerPort = deploy.publish.container_port;
+		if (settings.idle_timeout !== undefined)
+			lazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
+		if (settings.image !== undefined) lazyEntry.image = settings.image;
+	}
+
 	await writeDeployConfig(vibezzzDir, deploy);
 	return deploy;
 }
