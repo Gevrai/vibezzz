@@ -497,6 +497,13 @@ export async function updatePublishSettings(
 		const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
 		if (routeOk) {
 			releaseHostPort(existingLazyEntry.hostPort);
+			// Clear stale retired-route metadata now that this route is active
+			if (retiredRoutePorts.has(deploy.publish.caddy_route_id) ||
+				deploy.publish.retired_route_ports?.[deploy.publish.caddy_route_id] != null ||
+				deploy.publish.retired_routes?.includes(deploy.publish.caddy_route_id)) {
+				clearRetiredRouteMetadata(deploy.publish, deploy.publish.caddy_route_id);
+				await writeDeployConfig(vibezzzDir, deploy);
+			}
 		} else {
 			// Keep port tracked while the stale direct route still references it
 			trackHostPort(existingLazyEntry.hostPort);
@@ -1299,6 +1306,13 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 						const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, hostPort);
 						if (!routeOk) {
 							throw new Error(`Failed to switch Caddy route to live container for ${host}`);
+						}
+						// Clear stale retired-route metadata now that this route is active
+						if (retiredRoutePorts.has(deploy.publish.caddy_route_id) ||
+							deploy.publish.retired_route_ports?.[deploy.publish.caddy_route_id] != null ||
+							deploy.publish.retired_routes?.includes(deploy.publish.caddy_route_id)) {
+							clearRetiredRouteMetadata(deploy.publish, deploy.publish.caddy_route_id);
+							await writeDeployConfig(entry.vibezzzDir, deploy);
 						}
 					} else {
 						// State, identity, or settings changed during wake — abort
