@@ -14,6 +14,7 @@ import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { readDeployConfig } from '$lib/server/preview';
 import { applyPublishState, updatePublishSettings, type PublishState } from '$lib/server/publish';
+import { reconciliationReady } from '$lib/server/reconcile';
 
 async function resolveProject(path: string) {
 	const { projectsDir } = getConfig();
@@ -54,6 +55,7 @@ export const GET: RequestHandler = async ({ params }) => {
 };
 
 export const POST: RequestHandler = async ({ params, request }) => {
+	await reconciliationReady();
 	const projectPath = params.path;
 	const { vibezzzDir, projectName } = await resolveProject(projectPath);
 	const body = await request.json();

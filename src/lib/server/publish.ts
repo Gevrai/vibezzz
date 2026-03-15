@@ -51,6 +51,7 @@ export interface PublishConfig {
 	container_name: string;
 	container_id: string | null;
 	container_port: number;
+	host_port: number | null;
 	idle_timeout: number;
 	last_request_at: string | null;
 	caddy_route_id: string;
@@ -63,6 +64,7 @@ interface LazyEntry {
 	projectPath: string;
 	containerName: string;
 	containerPort: number;
+	hostPort: number | null;
 	image: string;
 	idleTimeout: number;
 	lastRequestAt: number;
@@ -74,6 +76,37 @@ interface LazyEntry {
 const lazyRegistry = new Map<string, LazyEntry>();
 let idleTimerHandle: ReturnType<typeof setInterval> | null = null;
 
+// ── Host port allocation ────────────────────────────────────────────
+//
+// Published containers expose a dynamic host port distinct from their
+// internal container_port so multiple apps can coexist without collision.
+// Range: 40000-49999 (10 000 ports).
+
+const HOST_PORT_START = 40000;
+const HOST_PORT_END = 49999;
+const allocatedHostPorts = new Set<number>();
+
+/**
+ * Pick the next free host port that isn't already allocated in-memory
+ * and isn't bound on the OS.
+ */
+async function allocateHostPort(): Promise<number> {
+	for (let port = HOST_PORT_START; port <= HOST_PORT_END; port++) {
+		if (allocatedHostPorts.has(port)) continue;
+		allocatedHostPorts.add(port);
+		return port;
+	}
+	throw new Error('No free host ports in the publish range');
+}
+
+function releaseHostPort(port: number | null | undefined): void {
+	if (port != null) allocatedHostPorts.delete(port);
+}
+
+function trackHostPort(port: number | null | undefined): void {
+	if (port != null) allocatedHostPorts.add(port);
+}
+
 export function getLazyRegistry(): ReadonlyMap<string, LazyEntry> {
 	return lazyRegistry;
 }
@@ -82,6 +115,31 @@ export function getLazyRegistry(): ReadonlyMap<string, LazyEntry> {
 
 function runtime(): string {
 	return getConfig().containerRuntime;
+}
+
+// ── deploy.yaml serialization lock ──────────────────────────────────
+//
+// All async read-modify-write cycles on a project's deploy.yaml go through
+// this per-directory lock so concurrent writers (idle timer, persistLastRequest,
+// wakeAndProxy) don't clobber each other.
+
+const deployLocks = new Map<string, Promise<void>>();
+
+async function withDeployLock<T>(vibezzzDir: string, fn: () => Promise<T>): Promise<T> {
+	const prev = deployLocks.get(vibezzzDir) ?? Promise.resolve();
+	let release: () => void;
+	const next = new Promise<void>((r) => { release = r; });
+	deployLocks.set(vibezzzDir, next);
+
+	await prev;
+	try {
+		return await fn();
+	} finally {
+		release!();
+		if (deployLocks.get(vibezzzDir) === next) {
+			deployLocks.delete(vibezzzDir);
+		}
+	}
 }
 
 export function defaultPublish(projectName: string): PublishConfig {
@@ -94,6 +152,7 @@ export function defaultPublish(projectName: string): PublishConfig {
 		container_name: `vibebox-${subdomain}`,
 		container_id: null,
 		container_port: 3001,
+		host_port: null,
 		idle_timeout: 300,
 		last_request_at: null,
 		caddy_route_id: `vibebox-${subdomain}`
@@ -124,7 +183,8 @@ export async function containerIsRunning(name: string): Promise<boolean> {
 export async function startContainer(
 	name: string,
 	image: string,
-	port: number
+	containerPort: number,
+	hostPort: number
 ): Promise<string | null> {
 	// Remove existing container if present
 	if (await containerExists(name)) {
@@ -137,7 +197,7 @@ export async function startContainer(
 		const { stdout } = await execFileAsync(runtime(), [
 			'run', '-d',
 			'--name', name,
-			'-p', `${port}:${port}`,
+			'-p', `${hostPort}:${containerPort}`,
 			'--restart', 'unless-stopped',
 			image
 		]);
@@ -221,7 +281,9 @@ export async function updatePublishSettings(
 			// Stop old container if running (name is changing)
 			if (deploy.publish.container_id) {
 				await stopContainer(oldContainerName);
+				releaseHostPort(deploy.publish.host_port);
 				deploy.publish.container_id = null;
+				deploy.publish.host_port = null;
 			}
 
 			if (previousState === 'up') {
@@ -248,6 +310,7 @@ export async function updatePublishSettings(
 				projectPath: projectName,
 				containerName: deploy.publish.container_name,
 				containerPort: deploy.publish.container_port,
+				hostPort: null,
 				image: deploy.publish.image,
 				idleTimeout: deploy.publish.idle_timeout || config.lazyIdleTimeout,
 				lastRequestAt: Date.now(),
@@ -277,7 +340,10 @@ export async function updatePublishSettings(
 			const running = await containerIsRunning(lazyEntry.containerName);
 			if (running) {
 				await stopContainer(lazyEntry.containerName);
+				releaseHostPort(lazyEntry.hostPort);
+				lazyEntry.hostPort = null;
 				deploy.publish.container_id = null;
+				deploy.publish.host_port = null;
 			}
 		}
 	}
@@ -329,16 +395,22 @@ export async function applyPublishState(
 		// Remove from lazy registry if transitioning from lazy → up
 		lazyRegistry.delete(pub.subdomain);
 
-		const containerId = await startContainer(pub.container_name, pub.image, pub.container_port);
+		// Release any previously allocated host port before allocating a new one
+		releaseHostPort(pub.host_port);
+
+		const hostPort = await allocateHostPort();
+		const containerId = await startContainer(pub.container_name, pub.image, pub.container_port, hostPort);
 		if (!containerId) {
+			releaseHostPort(hostPort);
 			throw new Error('Failed to start container');
 		}
 
 		const host = `${pub.subdomain}.${config.domain}`;
-		await upsertRoute(pub.caddy_route_id, host, pub.container_port);
+		await upsertRoute(pub.caddy_route_id, host, hostPort);
 
 		pub.state = 'up';
 		pub.container_id = containerId;
+		pub.host_port = hostPort;
 		pub.url = `https://${host}`;
 
 		// Update project stage
@@ -369,8 +441,12 @@ export async function applyPublishState(
 		const host = `${pub.subdomain}.${config.domain}`;
 		await upsertRoute(pub.caddy_route_id, host, config.port);
 
+		// Release any previously allocated host port — lazy allocates on wake
+		releaseHostPort(pub.host_port);
+
 		pub.state = 'lazy';
 		pub.container_id = null;
+		pub.host_port = null;
 		pub.url = `https://${host}`;
 
 		// Register in lazy in-memory map for wake-on-request
@@ -379,6 +455,7 @@ export async function applyPublishState(
 			projectPath,
 			containerName: pub.container_name,
 			containerPort: pub.container_port,
+			hostPort: null,
 			image: pub.image,
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
 			lastRequestAt: Date.now(),
@@ -405,8 +482,11 @@ export async function applyPublishState(
 		await removeRoute(pub.caddy_route_id);
 		lazyRegistry.delete(pub.subdomain);
 
+		releaseHostPort(pub.host_port);
+
 		pub.state = 'down';
 		pub.container_id = null;
+		pub.host_port = null;
 		pub.url = null;
 
 		// Only revert project_stage if it was set to 'published' by the publish flow.
@@ -445,18 +525,22 @@ export async function reconcilePublish(
 		const running = await containerIsRunning(pub.container_name);
 		if (!running) {
 			// Container is gone — mark as down
+			releaseHostPort(pub.host_port);
 			pub.state = 'down';
 			pub.container_id = null;
+			pub.host_port = null;
 			pub.url = null;
 			await removeRoute(pub.caddy_route_id);
 			await writeDeployConfig(vibezzzDir, deploy);
 			console.warn(`[publish] Reconcile: container ${pub.container_name} gone for ${projectPath}, marked down`);
 			return;
 		}
-		// Re-register route pointing to container
+		// Track the host port so it won't be re-allocated
+		trackHostPort(pub.host_port);
+		// Re-register route pointing to the host port (or container port for legacy configs)
 		if (pub.subdomain) {
 			const host = `${pub.subdomain}.${config.domain}`;
-			await upsertRoute(pub.caddy_route_id, host, pub.container_port);
+			await upsertRoute(pub.caddy_route_id, host, pub.host_port ?? pub.container_port);
 		}
 	}
 
@@ -465,9 +549,14 @@ export async function reconcilePublish(
 		if (pub.container_id) {
 			const running = await containerIsRunning(pub.container_name);
 			if (!running) {
+				releaseHostPort(pub.host_port);
 				pub.container_id = null;
+				pub.host_port = null;
 				await writeDeployConfig(vibezzzDir, deploy);
 				console.warn(`[publish] Reconcile: stale container_id cleared for lazy project ${projectPath}`);
+			} else {
+				// Container still running from before restart — track its host port
+				trackHostPort(pub.host_port);
 			}
 		}
 
@@ -486,6 +575,7 @@ export async function reconcilePublish(
 			projectPath,
 			containerName: pub.container_name,
 			containerPort: pub.container_port,
+			hostPort: pub.host_port ?? null,
 			image: pub.image,
 			idleTimeout: pub.idle_timeout || config.lazyIdleTimeout,
 			lastRequestAt: restoredLastRequest,
@@ -533,41 +623,56 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 
 	// Check if container is already running
 	const running = await containerIsRunning(entry.containerName);
-	if (running) {
-		return entry.containerPort;
+	if (running && entry.hostPort) {
+		return entry.hostPort;
 	}
 
 	// Serialize concurrent start attempts
 	if (entry.startPromise) {
 		const ok = await entry.startPromise;
-		return ok ? entry.containerPort : null;
+		return ok ? entry.hostPort : null;
 	}
 
 	entry.starting = true;
 	entry.startPromise = (async () => {
 		try {
+			// Allocate a fresh host port for this container
+			releaseHostPort(entry.hostPort);
+			const hostPort = await allocateHostPort();
+			entry.hostPort = hostPort;
+
 			const containerId = await startContainer(
 				entry.containerName,
 				entry.image,
-				entry.containerPort
+				entry.containerPort,
+				hostPort
 			);
-			if (!containerId) return false;
-
-			// Wait for the container to be healthy
-			const healthy = await waitForContainerHealthy(entry.containerPort);
-			if (!healthy) {
-				console.warn(`[publish] Lazy container ${entry.containerName} started but not healthy`);
-				await stopContainer(entry.containerName);
+			if (!containerId) {
+				releaseHostPort(hostPort);
+				entry.hostPort = null;
 				return false;
 			}
 
-			// Persist container_id
-			const deploy = await readDeployConfig(entry.vibezzzDir);
-			if (deploy?.publish) {
-				deploy.publish.container_id = containerId;
-				deploy.publish.last_request_at = new Date().toISOString();
-				await writeDeployConfig(entry.vibezzzDir, deploy);
+			// Wait for the container to be healthy
+			const healthy = await waitForContainerHealthy(hostPort);
+			if (!healthy) {
+				console.warn(`[publish] Lazy container ${entry.containerName} started but not healthy`);
+				await stopContainer(entry.containerName);
+				releaseHostPort(hostPort);
+				entry.hostPort = null;
+				return false;
 			}
+
+			// Persist container_id and host_port atomically via the deploy lock
+			await withDeployLock(entry.vibezzzDir, async () => {
+				const deploy = await readDeployConfig(entry.vibezzzDir);
+				if (deploy?.publish) {
+					deploy.publish.container_id = containerId;
+					deploy.publish.host_port = hostPort;
+					deploy.publish.last_request_at = new Date().toISOString();
+					await writeDeployConfig(entry.vibezzzDir, deploy);
+				}
+			});
 
 			console.log(`[publish] Lazy wake: started ${entry.containerName} for ${subdomain}`);
 			return true;
@@ -581,15 +686,17 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 	})();
 
 	const ok = await entry.startPromise;
-	return ok ? entry.containerPort : null;
+	return ok ? entry.hostPort : null;
 }
 
 async function persistLastRequest(entry: LazyEntry): Promise<void> {
-	const deploy = await readDeployConfig(entry.vibezzzDir);
-	if (deploy?.publish) {
-		deploy.publish.last_request_at = new Date().toISOString();
-		await writeDeployConfig(entry.vibezzzDir, deploy);
-	}
+	await withDeployLock(entry.vibezzzDir, async () => {
+		const deploy = await readDeployConfig(entry.vibezzzDir);
+		if (deploy?.publish) {
+			deploy.publish.last_request_at = new Date().toISOString();
+			await writeDeployConfig(entry.vibezzzDir, deploy);
+		}
+	});
 }
 
 // ── Idle timeout cleanup ────────────────────────────────────────────
@@ -627,12 +734,19 @@ export async function checkIdleContainers(): Promise<void> {
 
 		await stopContainer(entry.containerName);
 
-		// Update deploy.yaml
-		const deploy = await readDeployConfig(entry.vibezzzDir);
-		if (deploy?.publish) {
-			deploy.publish.container_id = null;
-			await writeDeployConfig(entry.vibezzzDir, deploy);
-		}
+		// Release the host port and clear it from the entry
+		releaseHostPort(entry.hostPort);
+		entry.hostPort = null;
+
+		// Update deploy.yaml under lock
+		await withDeployLock(entry.vibezzzDir, async () => {
+			const deploy = await readDeployConfig(entry.vibezzzDir);
+			if (deploy?.publish) {
+				deploy.publish.container_id = null;
+				deploy.publish.host_port = null;
+				await writeDeployConfig(entry.vibezzzDir, deploy);
+			}
+		});
 	}
 }
 

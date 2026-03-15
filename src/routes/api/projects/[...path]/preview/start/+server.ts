@@ -9,8 +9,10 @@ import { realpath } from 'node:fs/promises';
 import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { startPreview } from '$lib/server/preview';
+import { reconciliationReady } from '$lib/server/reconcile';
 
 export const POST: RequestHandler = async ({ params }) => {
+	await reconciliationReady();
 	const projectPath = params.path;
 	const { projectsDir } = getConfig();
 	const absPath = join(projectsDir, projectPath);

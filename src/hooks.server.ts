@@ -5,10 +5,12 @@
  */
 
 import type { Handle } from '@sveltejs/kit';
-import { reconcileOnStartup } from '$lib/server/reconcile';
+import { reconcileOnStartup, reconciliationReady } from '$lib/server/reconcile';
 import { isLazyHost, wakeAndProxy } from '$lib/server/publish';
 
-// Run reconciliation on startup (non-blocking)
+// Run reconciliation on startup (non-blocking).
+// The exported reconciliationReady() gate prevents mutating APIs from
+// racing with in-memory rehydration.
 reconcileOnStartup().catch((err) => {
 	console.error('[hooks] Startup reconciliation failed:', err);
 });

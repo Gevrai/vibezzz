@@ -37,6 +37,7 @@ export interface DeployConfig {
 		container_name: string;
 		container_id: string | null;
 		container_port: number;
+		host_port: number | null;
 		idle_timeout: number;
 		last_request_at: string | null;
 		caddy_route_id: string;

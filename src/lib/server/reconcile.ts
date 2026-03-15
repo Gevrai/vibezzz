@@ -126,11 +126,37 @@ async function isProcessValid(
 
 // ── Public API ───────────────────────────────────────────────────────
 
+// ── Reconciliation gate ─────────────────────────────────────────────
+//
+// Mutating APIs (run, preview, publish) must await reconciliationReady()
+// before checking in-memory state.  This prevents duplicate starts during
+// the async reconciliation window after a server restart.
+
+let _reconcileResolve: () => void;
+let _reconcilePromise: Promise<void> = new Promise((r) => { _reconcileResolve = r; });
+
+/**
+ * Wait until startup reconciliation has completed.
+ * Mutating API handlers should call this before proceeding.
+ */
+export function reconciliationReady(): Promise<void> {
+	return _reconcilePromise;
+}
+
 /**
  * Reconcile all agent runs and preview processes across all projects.
- * Called once on server startup.
+ * Called once on server startup.  Always resolves the reconciliation gate
+ * so mutating APIs are never permanently blocked.
  */
 export async function reconcileOnStartup(): Promise<void> {
+	try {
+		await _doReconcile();
+	} finally {
+		_reconcileResolve();
+	}
+}
+
+async function _doReconcile(): Promise<void> {
 	console.log('[reconcile] Starting startup reconciliation…');
 
 	const config = getConfig();

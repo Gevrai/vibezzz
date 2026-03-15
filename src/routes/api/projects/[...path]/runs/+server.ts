@@ -11,6 +11,7 @@ import { realpath } from 'node:fs/promises';
 import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { startRun, getRunHistory } from '$lib/server/agents';
+import { reconciliationReady } from '$lib/server/reconcile';
 import type { ProviderName, RunKind } from '$lib/server/providers';
 
 async function resolveProject(path: string) {
@@ -52,6 +53,7 @@ export const GET: RequestHandler = async ({ params }) => {
 };
 
 export const POST: RequestHandler = async ({ params, request }) => {
+	await reconciliationReady();
 	const { resolvedPath, vibezzzDir } = await resolveProject(params.path);
 	const body = await request.json();
 
