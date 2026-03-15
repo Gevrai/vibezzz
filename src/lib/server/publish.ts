@@ -116,17 +116,37 @@ function isPortFree(port: number): Promise<boolean> {
 }
 
 /**
+ * Serialization queue for host-port allocation.
+ *
+ * allocateHostPort()'s check/probe/add sequence is non-atomic across
+ * concurrent callers (e.g. parallel lazy wakes for different subdomains).
+ * This global queue ensures only one allocation runs at a time.
+ */
+let portAllocationQueue = Promise.resolve();
+
+/**
  * Pick the next free host port that isn't already allocated in-memory
- * and isn't bound on the OS.
+ * and isn't bound on the OS.  Serialized via portAllocationQueue so
+ * concurrent callers cannot race on the same port.
  */
 async function allocateHostPort(): Promise<number> {
-	for (let port = HOST_PORT_START; port <= HOST_PORT_END; port++) {
-		if (allocatedHostPorts.has(port)) continue;
-		if (!(await isPortFree(port))) continue;
-		allocatedHostPorts.add(port);
-		return port;
+	let release!: () => void;
+	const next = new Promise<void>((r) => { release = r; });
+	const prev = portAllocationQueue;
+	portAllocationQueue = next;
+
+	await prev;
+	try {
+		for (let port = HOST_PORT_START; port <= HOST_PORT_END; port++) {
+			if (allocatedHostPorts.has(port)) continue;
+			if (!(await isPortFree(port))) continue;
+			allocatedHostPorts.add(port);
+			return port;
+		}
+		throw new Error('No free host ports in the publish range');
+	} finally {
+		release();
 	}
-	throw new Error('No free host ports in the publish range');
 }
 
 function releaseHostPort(port: number | null | undefined): void {
@@ -324,6 +344,8 @@ export async function updatePublishSettings(
 	let oldRouteToRemove: string | null = null;
 	let oldSubdomainToDelete: string | null = null;
 	let lazyReRegistration: (() => void) | null = null;
+	let containerToStop: string | null = null;
+	let portToRelease: number | null = null;
 
 	if (settings.subdomain !== undefined && settings.subdomain !== deploy.publish.subdomain) {
 		// Reject if subdomain is already claimed by another project
@@ -336,11 +358,12 @@ export async function updatePublishSettings(
 		const oldContainerName = deploy.publish.container_name;
 		const previousState = deploy.publish.state;
 
-		// Stop old container if running (name is changing) — not a routing change
+		// Defer container stop until after persist so a failed write
+		// doesn't leave a dead container with no rollback path.
 		if (deploy.publish.state !== 'down') {
 			if (deploy.publish.container_id) {
-				await stopContainer(oldContainerName);
-				releaseHostPort(deploy.publish.host_port);
+				containerToStop = oldContainerName;
+				portToRelease = deploy.publish.host_port;
 				deploy.publish.container_id = null;
 				deploy.publish.host_port = null;
 			}
@@ -395,36 +418,13 @@ export async function updatePublishSettings(
 		portChanged = settings.container_port !== undefined && settings.container_port !== existingLazyEntry.containerPort;
 
 		if (imageChanged || portChanged) {
-			// Disable the entry BEFORE teardown so in-flight wakeAndProxy()
+			// Disable the entry BEFORE persist so in-flight wakeAndProxy()
 			// calls abort instead of waking with stale image/port settings.
+			// Container stop is deferred until after persist succeeds so a
+			// failed write doesn't leave a dead container with no rollback.
 			existingLazyEntry.disabled = true;
-
-			const running = await containerIsRunning(existingLazyEntry.containerName);
-			if (running) {
-				await stopContainer(existingLazyEntry.containerName);
-				releaseHostPort(existingLazyEntry.hostPort);
-				existingLazyEntry.hostPort = null;
-				deploy.publish.container_id = null;
-				deploy.publish.host_port = null;
-
-				// Restore Caddy route to vibebox's wake endpoint so the
-				// hostname doesn't point at a dead upstream until the next
-				// lazy wake re-switches it.
-				const config = getConfig();
-				const host = `${deploy.publish.subdomain}.${config.domain}`;
-				const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
-				if (!routeOk) {
-					// Wake route restoration is mandatory — without it the
-					// hostname points at a dead upstream with no way to recover.
-					existingLazyEntry.disabled = false;
-					throw new Error(`Failed to restore wake route for ${host} after stopping lazy container`);
-				}
-			}
-
-			// Do NOT sync new settings into the entry or re-enable here.
-			// The entry stays disabled until persistence succeeds (below)
-			// so that in-flight wakes abort and no wake can use unpersisted
-			// image/port values.
+			deploy.publish.container_id = null;
+			deploy.publish.host_port = null;
 		}
 	}
 
@@ -441,6 +441,32 @@ export async function updatePublishSettings(
 	}
 
 	// -- Live side-effects (only reached after successful persist) --
+
+	// Execute deferred container stop for subdomain change
+	if (containerToStop) {
+		await stopContainer(containerToStop);
+		releaseHostPort(portToRelease);
+	}
+
+	// Execute deferred container stop for image/port change on lazy entry
+	if (existingLazyEntry && (imageChanged || portChanged)) {
+		const running = await containerIsRunning(existingLazyEntry.containerName);
+		if (running) {
+			await stopContainer(existingLazyEntry.containerName);
+			releaseHostPort(existingLazyEntry.hostPort);
+			existingLazyEntry.hostPort = null;
+
+			// Restore Caddy route to vibebox's wake endpoint so the
+			// hostname doesn't point at a dead upstream until the next
+			// lazy wake re-switches it.
+			const config = getConfig();
+			const host = `${deploy.publish.subdomain}.${config.domain}`;
+			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+			if (!routeOk) {
+				console.error(`[publish] Failed to restore wake route for ${host} after stopping lazy container — will recover on next reconcile`);
+			}
+		}
+	}
 
 	// Disable old lazy entry before removal so in-flight wakeAndProxy()
 	// calls on the old subdomain abort instead of persisting stale metadata.
