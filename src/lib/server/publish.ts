@@ -543,6 +543,15 @@ export async function updatePublishSettings(
 			console.warn(`[publish] Old route ${oldRouteToRemove} removal failed during rename; persisted for reconciliation cleanup`);
 		} else {
 			releaseHostPort(portToRelease);
+			// Release any retired-route metadata left by a prior failed
+			// idle-shutdown or route removal for this now-removed route.
+			const hadRetired = retiredRoutePorts.has(oldRouteToRemove) ||
+				deploy.publish.retired_route_ports?.[oldRouteToRemove] != null ||
+				deploy.publish.retired_routes?.includes(oldRouteToRemove);
+			if (hadRetired) {
+				clearRetiredRouteMetadata(deploy.publish, oldRouteToRemove);
+				await writeDeployConfig(vibezzzDir, deploy);
+			}
 		}
 	}
 	if (oldSubdomainToDelete) {
@@ -907,6 +916,15 @@ export async function applyPublishState(
 		} else {
 			releaseHostPort(priorHostPort);
 			lazyRegistry.delete(pub.subdomain);
+			// Release any retired-route metadata left by a prior failed
+			// idle-shutdown or route removal for this route.
+			const hadRetired = retiredRoutePorts.has(pub.caddy_route_id) ||
+				pub.retired_route_ports?.[pub.caddy_route_id] != null ||
+				pub.retired_routes?.includes(pub.caddy_route_id);
+			if (hadRetired) {
+				clearRetiredRouteMetadata(pub, pub.caddy_route_id);
+				await writeDeployConfig(vibezzzDir, deploy);
+			}
 		}
 
 		// Only revert project_stage if it was set to 'published' by the publish flow.
