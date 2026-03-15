@@ -27,6 +27,7 @@
 	let publishState = $state<'up' | 'down' | 'lazy'>((data.deploy?.publish?.state as 'up' | 'down' | 'lazy') ?? 'down');
 	let publishingAction = $state(false);
 	let savingPublish = $state(false);
+	let publishError = $state('');
 
 	// Re-sync local state when data changes (e.g. after navigation)
 	$effect(() => {
@@ -233,8 +234,9 @@
 	// Publish actions
 	async function savePublishConfig() {
 		savingPublish = true;
+		publishError = '';
 		try {
-			await fetch(`/api/projects/${data.path}/publish`, {
+			const resp = await fetch(`/api/projects/${data.path}/publish`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -242,6 +244,10 @@
 					subdomain: publishSubdomain
 				})
 			});
+			if (!resp.ok) {
+				const body = await resp.json().catch(() => null);
+				throw new Error(body?.message ?? `Save failed (${resp.status})`);
+			}
 		} finally {
 			savingPublish = false;
 		}
@@ -249,14 +255,21 @@
 
 	async function publishAction() {
 		publishingAction = true;
+		publishError = '';
 		try {
 			await savePublishConfig();
-			await fetch(`/api/projects/${data.path}/publish`, {
+			const resp = await fetch(`/api/projects/${data.path}/publish`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ state: publishState })
 			});
+			if (!resp.ok) {
+				const body = await resp.json().catch(() => null);
+				throw new Error(body?.message ?? `Publish failed (${resp.status})`);
+			}
 			location.reload();
+		} catch (err) {
+			publishError = err instanceof Error ? err.message : 'Publish failed';
 		} finally {
 			publishingAction = false;
 		}
@@ -264,13 +277,20 @@
 
 	async function unpublishAction() {
 		publishingAction = true;
+		publishError = '';
 		try {
-			await fetch(`/api/projects/${data.path}/publish`, {
+			const resp = await fetch(`/api/projects/${data.path}/publish`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ state: 'down' })
 			});
+			if (!resp.ok) {
+				const body = await resp.json().catch(() => null);
+				throw new Error(body?.message ?? `Unpublish failed (${resp.status})`);
+			}
 			location.reload();
+		} catch (err) {
+			publishError = err instanceof Error ? err.message : 'Unpublish failed';
 		} finally {
 			publishingAction = false;
 		}
@@ -688,7 +708,7 @@
 
 				<div class="mt-3 flex flex-wrap gap-2">
 					<button
-						onclick={savePublishConfig}
+						onclick={async () => { publishError = ''; try { await savePublishConfig(); } catch (err) { publishError = err instanceof Error ? err.message : 'Save failed'; } }}
 						disabled={savingPublish}
 						class="rounded bg-gray-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-gray-600 disabled:opacity-50"
 					>
@@ -720,6 +740,10 @@
 						</button>
 					{/if}
 				</div>
+
+				{#if publishError}
+					<p class="mt-2 text-sm text-red-400">{publishError}</p>
+				{/if}
 
 				{#if data.deploy?.publish?.container_id}
 					<p class="mt-2 text-xs text-gray-500">
