@@ -458,12 +458,14 @@ export async function updatePublishSettings(
 
 			// Restore Caddy route to vibebox's wake endpoint so the
 			// hostname doesn't point at a dead upstream until the next
-			// lazy wake re-switches it.
+			// lazy wake re-switches it.  This is mandatory — failure
+			// leaves the hostname dead with no automatic recovery path
+			// other than a full reconcile.
 			const config = getConfig();
 			const host = `${deploy.publish.subdomain}.${config.domain}`;
 			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
 			if (!routeOk) {
-				console.error(`[publish] Failed to restore wake route for ${host} after stopping lazy container — will recover on next reconcile`);
+				throw new Error(`Failed to restore wake route for ${host} after image/port change — hostname unreachable`);
 			}
 		}
 	}
@@ -653,13 +655,10 @@ export async function applyPublishState(
 			throw new SubdomainConflictError(pub.subdomain);
 		}
 
-		// Stop container if running (lazy starts on demand)
-		if (pub.container_id) {
-			await stopContainer(pub.container_name);
-		}
-
-		// Release any previously allocated host port — lazy allocates on wake
-		releaseHostPort(pub.host_port);
+		// Save prior runtime state; defer destructive teardown until after
+		// persist succeeds so a failed write doesn't leave a dead container.
+		const priorContainerId = pub.container_id;
+		const priorHostPort = pub.host_port;
 
 		const host = `${pub.subdomain}.${config.domain}`;
 		pub.state = 'lazy';
@@ -667,8 +666,14 @@ export async function applyPublishState(
 		pub.host_port = null;
 		pub.url = `https://${host}`;
 
-		// Persist before live side-effects
+		// Persist before destructive runtime changes
 		await writeDeployConfig(vibezzzDir, deploy);
+
+		// Tear down the old container now that persist succeeded
+		if (priorContainerId) {
+			await stopContainer(pub.container_name);
+		}
+		releaseHostPort(priorHostPort);
 
 		// Live side-effects: Caddy wake route + lazy registry + meta
 		const routeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
@@ -709,20 +714,30 @@ export async function applyPublishState(
 		const lazyEntry = lazyRegistry.get(pub.subdomain);
 		if (lazyEntry) lazyEntry.disabled = true;
 
-		// Stop container
-		if (pub.container_id || await containerIsRunning(pub.container_name)) {
-			await stopContainer(pub.container_name);
-		}
-
-		releaseHostPort(pub.host_port);
+		// Save prior runtime state; defer destructive teardown until after
+		// persist succeeds so a failed write doesn't leave a dead container.
+		const priorContainerId = pub.container_id;
+		const priorHostPort = pub.host_port;
+		const needsContainerStop = !!(priorContainerId || await containerIsRunning(pub.container_name));
 
 		pub.state = 'down';
 		pub.container_id = null;
 		pub.host_port = null;
 		pub.url = null;
 
-		// Persist before live side-effects
-		await writeDeployConfig(vibezzzDir, deploy);
+		// Persist before destructive runtime changes
+		try {
+			await writeDeployConfig(vibezzzDir, deploy);
+		} catch (err) {
+			if (lazyEntry) lazyEntry.disabled = false;
+			throw err;
+		}
+
+		// Tear down the old container now that persist succeeded
+		if (needsContainerStop) {
+			await stopContainer(pub.container_name);
+		}
+		releaseHostPort(priorHostPort);
 
 		// Live side-effects: Caddy route removal + lazy registry cleanup + meta
 		const routeOk = await removeRoute(pub.caddy_route_id);
