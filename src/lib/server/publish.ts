@@ -402,6 +402,13 @@ export async function updatePublishSettings(
 				existingLazyEntry.hostPort = null;
 				deploy.publish.container_id = null;
 				deploy.publish.host_port = null;
+
+				// Restore Caddy route to vibebox's wake endpoint so the
+				// hostname doesn't point at a dead upstream until the next
+				// lazy wake re-switches it.
+				const config = getConfig();
+				const host = `${deploy.publish.subdomain}.${config.domain}`;
+				await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
 			}
 		}
 	}
@@ -510,8 +517,11 @@ export async function applyPublishState(
 			throw new SubdomainConflictError(pub.subdomain);
 		}
 
-		// Save lazy entry so we can restore it if the transition fails
+		// Disable the lazy entry before removing it so any in-flight
+		// wakeAndProxy() call aborts instead of continuing to start/persist
+		// a container that the new 'up' transition will replace.
 		const savedLazyEntry = lazyRegistry.get(pub.subdomain) ?? null;
+		if (savedLazyEntry) savedLazyEntry.disabled = true;
 		lazyRegistry.delete(pub.subdomain);
 
 		// Release any previously allocated host port before allocating a new one
@@ -521,7 +531,10 @@ export async function applyPublishState(
 		const containerId = await startContainer(pub.container_name, pub.image, pub.container_port, hostPort);
 		if (!containerId) {
 			releaseHostPort(hostPort);
-			if (savedLazyEntry) registerLazy(pub.subdomain, savedLazyEntry);
+			if (savedLazyEntry) {
+				savedLazyEntry.disabled = false;
+				registerLazy(pub.subdomain, savedLazyEntry);
+			}
 			throw new Error('Failed to start container');
 		}
 
@@ -538,7 +551,10 @@ export async function applyPublishState(
 		} catch (err) {
 			await stopContainer(pub.container_name);
 			releaseHostPort(hostPort);
-			if (savedLazyEntry) registerLazy(pub.subdomain, savedLazyEntry);
+			if (savedLazyEntry) {
+				savedLazyEntry.disabled = false;
+				registerLazy(pub.subdomain, savedLazyEntry);
+			}
 			throw err;
 		}
 
@@ -552,7 +568,10 @@ export async function applyPublishState(
 			pub.container_id = null;
 			pub.host_port = null;
 			pub.url = null;
-			if (savedLazyEntry) registerLazy(pub.subdomain, savedLazyEntry);
+			if (savedLazyEntry) {
+				savedLazyEntry.disabled = false;
+				registerLazy(pub.subdomain, savedLazyEntry);
+			}
 			await writeDeployConfig(vibezzzDir, deploy);
 			throw new Error(`Failed to register Caddy route for ${host}`);
 		}
@@ -793,10 +812,11 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 	if (running && entry.hostPort) {
 		// Ensure Caddy routes directly to the live container (may have been
 		// missed if a previous route update failed or if the request arrived
-		// during a brief race window).
+		// during a brief race window).  If the route switch fails, return
+		// null so hooks.server.ts responds 503 instead of redirect-looping.
 		const host = `${subdomain}.${config.domain}`;
-		await upsertRoute(`vibebox-${subdomain}`, host, entry.hostPort);
-		return entry.hostPort;
+		const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, entry.hostPort);
+		return routeOk ? entry.hostPort : null;
 	}
 
 	// Serialize concurrent start attempts
@@ -863,7 +883,10 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 						// container so subsequent traffic bypasses vibebox
 						// (supports WebSockets, SSE, and long-lived requests).
 						const host = `${subdomain}.${config.domain}`;
-						await upsertRoute(deploy.publish.caddy_route_id, host, hostPort);
+						const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, hostPort);
+						if (!routeOk) {
+							throw new Error(`Failed to switch Caddy route to live container for ${host}`);
+						}
 					} else {
 						// State or identity changed during wake (e.g. unpublished or subdomain renamed) — abort
 						throw new Error('Publish state or identity changed during lazy wake');
