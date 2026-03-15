@@ -739,23 +739,35 @@ export async function applyPublishState(
 		try {
 			await writeDeployConfig(vibezzzDir, deploy);
 		} catch (err) {
-			await stopContainer(pub.container_name);
+			const stopped = await stopContainer(pub.container_name);
 			releaseHostPort(hostPort);
 			if (savedLazyEntry) {
 				savedLazyEntry.disabled = false;
 				// Restore wake route only when rolling back to a prior lazy state
 				const wakeOk = await upsertRoute(pub.caddy_route_id, host, config.port);
-				if (!wakeOk) {
+				if (!wakeOk || !stopped) {
 					// Best-effort: re-read on-disk state (still 'lazy') to persist the flag
 					try {
 						const onDisk = await readDeployConfig(vibezzzDir);
 						if (onDisk?.publish) {
-							onDisk.publish.needs_wake_route = true;
+							if (!wakeOk) onDisk.publish.needs_wake_route = true;
+							if (!stopped) onDisk.publish.needs_container_stop = pub.container_name;
 							await writeDeployConfig(vibezzzDir, onDisk);
 						}
 					} catch { /* write may still fail — reconcile on restart */ }
-					console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} during persist rollback — persisted for reconciliation`);
+					if (!wakeOk) console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} during persist rollback — persisted for reconciliation`);
+					if (!stopped) console.warn(`[publish] Container ${pub.container_name} removal failed during persist rollback; persisted for reconciliation`);
 				}
+			} else if (!stopped) {
+				// No prior lazy state — best-effort persist needs_container_stop
+				try {
+					const onDisk = await readDeployConfig(vibezzzDir);
+					if (onDisk?.publish) {
+						onDisk.publish.needs_container_stop = pub.container_name;
+						await writeDeployConfig(vibezzzDir, onDisk);
+					}
+				} catch { /* write may still fail — reconcile on restart */ }
+				console.warn(`[publish] Container ${pub.container_name} removal failed during persist rollback; persisted for reconciliation`);
 			}
 			throw err;
 		}
@@ -764,10 +776,14 @@ export async function applyPublishState(
 		const routeOk = await upsertRoute(pub.caddy_route_id, host, hostPort);
 		if (!routeOk) {
 			// Caddy route failed — revert persisted state and clean up
-			await stopContainer(pub.container_name);
+			const stopped = await stopContainer(pub.container_name);
 			releaseHostPort(hostPort);
 			pub.container_id = null;
 			pub.host_port = null;
+			if (!stopped) {
+				pub.needs_container_stop = pub.container_name;
+				console.warn(`[publish] Container ${pub.container_name} removal failed during route rollback; persisted for reconciliation`);
+			}
 			if (savedLazyEntry) {
 				// Restore to prior lazy state, not down
 				pub.state = 'lazy';
@@ -1153,6 +1169,14 @@ export async function reconcilePublish(
 				trackHostPort(stalePort);
 				if (stalePort != null) retiredRoutePorts.set(pub.caddy_route_id, stalePort);
 			}
+			// Revert project_stage so the UI doesn't remain stuck on 'published'
+			const metaPath = join(vibezzzDir, 'meta.yaml');
+			const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
+			if (meta && meta.project_stage === 'published') {
+				meta.project_stage =
+					deploy.preview?.status === 'ready' ? 'preview_ready' : 'building';
+				await writeYaml(metaPath, meta);
+			}
 			console.warn(`[publish] Reconcile: container ${pub.container_name} gone for ${projectPath}, marked down`);
 			return;
 		}
@@ -1338,17 +1362,35 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 			const healthy = await waitForContainerHealthy(hostPort);
 			if (!healthy) {
 				console.warn(`[publish] Lazy container ${entry.containerName} started but not healthy`);
-				await stopContainer(entry.containerName);
+				const stopped = await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
+				if (!stopped) {
+					try {
+						await withDeployLock(entry.vibezzzDir, async () => {
+							const d = await readDeployConfig(entry.vibezzzDir);
+							if (d?.publish) { d.publish.needs_container_stop = entry.containerName; await writeDeployConfig(entry.vibezzzDir, d); }
+						});
+					} catch { /* best-effort */ }
+					console.warn(`[publish] Container ${entry.containerName} removal failed during unhealthy rollback; persisted for reconciliation`);
+				}
 				return null;
 			}
 
 			// Check if entry was disabled during wake (e.g. unpublish started)
 			if (entry.disabled) {
-				await stopContainer(entry.containerName);
+				const stopped = await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
+				if (!stopped) {
+					try {
+						await withDeployLock(entry.vibezzzDir, async () => {
+							const d = await readDeployConfig(entry.vibezzzDir);
+							if (d?.publish) { d.publish.needs_container_stop = entry.containerName; await writeDeployConfig(entry.vibezzzDir, d); }
+						});
+					} catch { /* best-effort */ }
+					console.warn(`[publish] Container ${entry.containerName} removal failed during disabled rollback; persisted for reconciliation`);
+				}
 				return null;
 			}
 
@@ -1356,9 +1398,18 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 			// container was started with stale values and must not persist.
 			if (entry.image !== wakeImage || entry.containerPort !== wakePort) {
 				console.warn(`[publish] Lazy wake aborted: settings changed during wake for ${entry.containerName}`);
-				await stopContainer(entry.containerName);
+				const stopped = await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
+				if (!stopped) {
+					try {
+						await withDeployLock(entry.vibezzzDir, async () => {
+							const d = await readDeployConfig(entry.vibezzzDir);
+							if (d?.publish) { d.publish.needs_container_stop = entry.containerName; await writeDeployConfig(entry.vibezzzDir, d); }
+						});
+					} catch { /* best-effort */ }
+					console.warn(`[publish] Container ${entry.containerName} removal failed during stale-settings rollback; persisted for reconciliation`);
+				}
 				return null;
 			}
 
@@ -1405,7 +1456,7 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				});
 			} catch (persistErr) {
 				console.error(`[publish] Lazy wake persistence failed for ${entry.containerName}, rolling back: ${(persistErr as Error).message}`);
-				await stopContainer(entry.containerName);
+				const stopped = await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
 
@@ -1415,6 +1466,11 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				try {
 					await withDeployLock(entry.vibezzzDir, async () => {
 						const currentDeploy = await readDeployConfig(entry.vibezzzDir);
+						if (!stopped && currentDeploy?.publish) {
+							currentDeploy.publish.needs_container_stop = entry.containerName;
+							await writeDeployConfig(entry.vibezzzDir, currentDeploy);
+							console.warn(`[publish] Container ${entry.containerName} removal failed during wake persistence rollback; persisted for reconciliation`);
+						}
 						if (
 							currentDeploy?.publish &&
 							currentDeploy.publish.state === 'lazy' &&
