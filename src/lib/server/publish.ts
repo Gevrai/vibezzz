@@ -395,6 +395,10 @@ export async function updatePublishSettings(
 		portChanged = settings.container_port !== undefined && settings.container_port !== existingLazyEntry.containerPort;
 
 		if (imageChanged || portChanged) {
+			// Disable the entry BEFORE teardown so in-flight wakeAndProxy()
+			// calls abort instead of waking with stale image/port settings.
+			existingLazyEntry.disabled = true;
+
 			const running = await containerIsRunning(existingLazyEntry.containerName);
 			if (running) {
 				await stopContainer(existingLazyEntry.containerName);
@@ -408,8 +412,21 @@ export async function updatePublishSettings(
 				// lazy wake re-switches it.
 				const config = getConfig();
 				const host = `${deploy.publish.subdomain}.${config.domain}`;
-				await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+				const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+				if (!routeOk) {
+					// Wake route restoration is mandatory — without it the
+					// hostname points at a dead upstream with no way to recover.
+					existingLazyEntry.disabled = false;
+					throw new Error(`Failed to restore wake route for ${host} after stopping lazy container`);
+				}
 			}
+
+			// Sync new settings into the entry immediately so any wake that
+			// starts after we re-enable uses the correct image/port.
+			if (settings.image !== undefined) existingLazyEntry.image = settings.image;
+			if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
+
+			existingLazyEntry.disabled = false;
 		}
 	}
 
@@ -446,9 +463,12 @@ export async function updatePublishSettings(
 			deploy.publish.url = deploy.publish.state === 'lazy' ? `https://${oldSubdomainToDelete}.${config.domain}` : deploy.publish.url;
 			await writeDeployConfig(vibezzzDir, deploy);
 
-			// Restore old Caddy route (best-effort)
+			// Restore old Caddy route — mandatory for the old subdomain to remain reachable
 			const oldHost = `${oldSubdomainToDelete}.${config.domain}`;
-			await upsertRoute(deploy.publish.caddy_route_id, oldHost, config.port);
+			const oldRouteOk = await upsertRoute(deploy.publish.caddy_route_id, oldHost, config.port);
+			if (!oldRouteOk) {
+				console.error(`[publish] CRITICAL: Failed to restore old wake route for ${oldHost} during rollback — hostname unreachable until next reconcile`);
+			}
 
 			// Restore old lazy registry entry so the project remains reachable
 			if (savedOldLazyEntry) {
@@ -461,13 +481,15 @@ export async function updatePublishSettings(
 		lazyReRegistration();
 	}
 
-	// Sync updated settings to the in-memory lazy registry
+	// Sync updated settings to the in-memory lazy registry.
+	// image/container_port are already synced above when imageChanged||portChanged,
+	// but idle_timeout and non-change cases still need this path.
 	if (existingLazyEntry) {
 		const config = getConfig();
-		if (settings.container_port !== undefined) existingLazyEntry.containerPort = deploy.publish.container_port;
+		if (settings.container_port !== undefined && !portChanged) existingLazyEntry.containerPort = deploy.publish.container_port;
 		if (settings.idle_timeout !== undefined)
 			existingLazyEntry.idleTimeout = deploy.publish.idle_timeout || config.lazyIdleTimeout;
-		if (settings.image !== undefined) existingLazyEntry.image = settings.image;
+		if (settings.image !== undefined && !imageChanged) existingLazyEntry.image = settings.image;
 	}
 
 	return deploy;
@@ -897,6 +919,14 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 				await stopContainer(entry.containerName);
 				releaseHostPort(hostPort);
 				entry.hostPort = null;
+
+				// Restore Caddy route to vibebox's wake endpoint so the
+				// hostname remains reachable for subsequent wake attempts.
+				const host = `${subdomain}.${config.domain}`;
+				const routeOk = await upsertRoute(`vibebox-${subdomain}`, host, config.port);
+				if (!routeOk) {
+					console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after wake rollback — hostname unreachable until next reconcile`);
+				}
 				return null;
 			}
 
@@ -987,10 +1017,14 @@ export async function checkIdleContainers(): Promise<void> {
 			releaseHostPort(entry.hostPort);
 			entry.hostPort = null;
 
-			// Revert Caddy route back to vibebox's port for wake-on-demand
+			// Revert Caddy route back to vibebox's port for wake-on-demand.
+			// This is mandatory — without it the hostname has no upstream.
 			const config = getConfig();
 			const host = `${subdomain}.${config.domain}`;
-			await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+			const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+			if (!routeOk) {
+				console.error(`[publish] CRITICAL: Failed to restore wake route for ${host} after idle shutdown — hostname unreachable until next reconcile`);
+			}
 
 			deploy.publish.container_id = null;
 			deploy.publish.host_port = null;
