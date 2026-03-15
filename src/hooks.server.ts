@@ -18,7 +18,8 @@ reconcileOnStartup().catch((err) => {
 /**
  * SvelteKit handle hook.
  * Intercepts requests whose hostname matches a lazy-published subdomain,
- * wakes the container on demand, and proxies the request through.
+ * wakes the container on demand, and redirects through Caddy's reverse
+ * proxy (which fully supports WebSocket upgrades and long-lived traffic).
  */
 export const handle: Handle = async ({ event, resolve }) => {
 	const host = event.request.headers.get('host');
@@ -32,29 +33,16 @@ export const handle: Handle = async ({ event, resolve }) => {
 		if (isLazyHost(hostname)) {
 			const port = await wakeAndProxy(hostname);
 			if (port) {
-				// Proxy the request to the container
+				// Container is running and Caddy route has been updated to
+				// point directly to it.  Redirect (307 preserves method and
+				// body) so the request goes through Caddy's full reverse
+				// proxy, which handles WebSocket upgrades, SSE, and
+				// long-lived connections without a timeout ceiling.
 				const url = new URL(event.request.url);
-				const targetUrl = `http://localhost:${port}${url.pathname}${url.search}`;
-				try {
-					const proxyResp = await fetch(targetUrl, {
-						method: event.request.method,
-						headers: event.request.headers,
-						body: event.request.method !== 'GET' && event.request.method !== 'HEAD'
-							? event.request.body
-							: undefined,
-						signal: AbortSignal.timeout(30_000),
-						// @ts-expect-error duplex needed for streaming body
-						duplex: 'half'
-					});
-					return new Response(proxyResp.body, {
-						status: proxyResp.status,
-						statusText: proxyResp.statusText,
-						headers: proxyResp.headers
-					});
-				} catch (err) {
-					console.error(`[hooks] Proxy to lazy container failed: ${(err as Error).message}`);
-					return new Response('Service temporarily unavailable', { status: 502 });
-				}
+				return new Response(null, {
+					status: 307,
+					headers: { Location: `https://${host}${url.pathname}${url.search}` }
+				});
 			} else {
 				return new Response('Service unavailable — container failed to start', { status: 503 });
 			}

@@ -791,6 +791,11 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 	// Check if container is already running
 	const running = await containerIsRunning(entry.containerName);
 	if (running && entry.hostPort) {
+		// Ensure Caddy routes directly to the live container (may have been
+		// missed if a previous route update failed or if the request arrived
+		// during a brief race window).
+		const host = `${subdomain}.${config.domain}`;
+		await upsertRoute(`vibebox-${subdomain}`, host, entry.hostPort);
 		return entry.hostPort;
 	}
 
@@ -854,6 +859,12 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 						deploy.publish.host_port = hostPort;
 						deploy.publish.last_request_at = new Date().toISOString();
 						await writeDeployConfig(entry.vibezzzDir, deploy);
+
+						// Switch Caddy route to point directly to the live
+						// container so subsequent traffic bypasses vibebox
+						// (supports WebSockets, SSE, and long-lived requests).
+						const host = `${subdomain}.${config.domain}`;
+						await upsertRoute(deploy.publish.caddy_route_id, host, hostPort);
 					} else {
 						// State or identity changed during wake (e.g. unpublished or subdomain renamed) — abort
 						throw new Error('Publish state or identity changed during lazy wake');
@@ -917,6 +928,9 @@ export async function checkIdleContainers(): Promise<void> {
 
 		if (idleMs < timeoutMs) continue;
 
+		// Skip entries that are currently waking
+		if (entry.starting || entry.startPromise) continue;
+
 		// Check if container is actually running before stopping
 		const running = await containerIsRunning(entry.containerName);
 		if (!running) continue;
@@ -925,20 +939,41 @@ export async function checkIdleContainers(): Promise<void> {
 			`[publish] Idle shutdown: ${entry.containerName} idle for ${Math.round(idleMs / 1000)}s (timeout: ${entry.idleTimeout}s)`
 		);
 
-		await stopContainer(entry.containerName);
-
-		// Release the host port and clear it from the entry
-		releaseHostPort(entry.hostPort);
-		entry.hostPort = null;
-
-		// Update deploy.yaml under lock
+		// Perform all cleanup under the deploy lock so a concurrent lazy
+		// wake that just restarted the container is not clobbered.
 		await withDeployLock(entry.vibezzzDir, async () => {
+			// Revalidate idle state — a request may have arrived while
+			// we were waiting for the lock.
+			const freshIdleMs = Date.now() - entry.lastRequestAt;
+			if (freshIdleMs < timeoutMs) return;
+
+			// Abort if a wake started while we waited for the lock
+			if (entry.starting || entry.startPromise) return;
+
+			// Revalidate identity against persisted state
 			const deploy = await readDeployConfig(entry.vibezzzDir);
-			if (deploy?.publish) {
-				deploy.publish.container_id = null;
-				deploy.publish.host_port = null;
-				await writeDeployConfig(entry.vibezzzDir, deploy);
+			if (
+				!deploy?.publish ||
+				deploy.publish.state !== 'lazy' ||
+				deploy.publish.subdomain !== subdomain ||
+				deploy.publish.container_name !== entry.containerName
+			) {
+				return;
 			}
+
+			// All checks passed — stop the container and clear metadata
+			await stopContainer(entry.containerName);
+			releaseHostPort(entry.hostPort);
+			entry.hostPort = null;
+
+			// Revert Caddy route back to vibebox's port for wake-on-demand
+			const config = getConfig();
+			const host = `${subdomain}.${config.domain}`;
+			await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+
+			deploy.publish.container_id = null;
+			deploy.publish.host_port = null;
+			await writeDeployConfig(entry.vibezzzDir, deploy);
 		});
 	}
 }
