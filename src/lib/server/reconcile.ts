@@ -19,6 +19,7 @@ import { getConfig } from './config.js';
 import { upsertRoute } from './caddy.js';
 import { checkPreviewHealth, rehydratePreview } from './preview.js';
 import type { AgentRunEntry } from './agents.js';
+import { rehydrateRun } from './agents.js';
 import type { DeployConfig } from './preview.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -168,6 +169,12 @@ export async function reconcileOnStartup(): Promise<void> {
 					reconciled++;
 					console.log(
 						`[reconcile] Marked stale agent run #${agent.id} as failed (project: ${project.path})`
+					);
+				} else {
+					// Process is still alive — rehydrate into in-memory tracking
+					rehydrateRun(project.path, agent, vibezzzDir);
+					console.log(
+						`[reconcile] Rehydrated active agent run #${agent.id} (project: ${project.path})`
 					);
 				}
 			}

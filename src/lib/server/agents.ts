@@ -221,6 +221,10 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 	const stdoutDone = pipeStreamToFile(handle.stdout, absLogPath, subs);
 	const stderrDone = pipeStreamToFile(handle.stderr, absLogPath, subs);
 
+	// Mutable flag for stop coordination — set before the completion handler
+	// can check it, referenced by both stopRun and the done closure.
+	let wasStopped = false;
+
 	// Create a completion promise
 	const done = (async () => {
 		try {
@@ -228,6 +232,9 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 
 			// Wait for streams to flush
 			await Promise.allSettled([stdoutDone, stderrDone]);
+
+			// If the run was explicitly stopped, don't overwrite the stopped status
+			if (wasStopped) return;
 
 			// Update YAML entry
 			const currentEntries = await readAgentsYaml(opts.vibezzzDir);
@@ -268,7 +275,9 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 				}
 			}
 
-			if (result.result === 'failed') {
+			// Spec: only notify on failure for automation/bootstrap runs
+			const isAutomated = opts.kind === 'bootstrap';
+			if (result.result === 'failed' && isAutomated) {
 				await notify(
 					'run_failed',
 					opts.projectPath,
@@ -285,6 +294,7 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 		entry,
 		projectPath: opts.projectPath,
 		stop: async () => {
+			wasStopped = true;
 			await handle.stop();
 		},
 		done
@@ -306,21 +316,20 @@ export async function stopRun(
 	const active = activeRuns.get(key);
 	if (!active) return null;
 
+	// active.stop() sets the wasStopped flag internally so the completion
+	// handler won't overwrite the status back to 'failed'.
 	await active.stop();
 
-	// Re-check: the completion handler may have already updated the entry
+	// Persist the stopped status in YAML
 	const entries = await readAgentsYaml(vibezzzDir);
 	const idx = entries.findIndex((e) => e.id === active.entry.id);
-	if (idx !== -1 && entries[idx].status === 'running') {
+	if (idx !== -1) {
 		entries[idx].status = 'stopped';
 		entries[idx].finished_at = new Date().toISOString();
-		entries[idx].result = 'building';
 		await writeAgentsYaml(vibezzzDir, entries);
 		return entries[idx];
 	}
 
-	// Already updated by completion handler
-	if (idx !== -1) return entries[idx];
 	return active.entry;
 }
 
@@ -341,4 +350,103 @@ export async function readRunLog(projectAbsPath: string, logPath: string): Promi
 	} catch {
 		return '';
 	}
+}
+
+/**
+ * Rehydrate a surviving active run into the in-memory map after restart.
+ * We don't have a ChildProcess handle, so we provide PID-based stop and
+ * poll-based completion tracking.
+ */
+export function rehydrateRun(
+	projectPath: string,
+	entry: AgentRunEntry,
+	vibezzzDir: string
+): void {
+	const key = runKey(projectPath);
+	if (activeRuns.has(key)) return;
+
+	const pid = entry.pid;
+
+	let doneResolve: () => void;
+	const done = new Promise<void>((resolve) => {
+		doneResolve = resolve;
+	});
+
+	// Poll for process exit every 5 seconds
+	const pollInterval = setInterval(async () => {
+		let alive = false;
+		if (pid) {
+			try {
+				process.kill(pid, 0);
+				alive = true;
+			} catch {
+				alive = false;
+			}
+		}
+		if (!alive) {
+			clearInterval(pollInterval);
+
+			// Update YAML entry
+			const entries = await readAgentsYaml(vibezzzDir);
+			const idx = entries.findIndex((e) => e.id === entry.id);
+			if (idx !== -1 && entries[idx].status === 'running') {
+				entries[idx].status = 'failed';
+				entries[idx].finished_at = new Date().toISOString();
+				entries[idx].result = 'failed';
+				await writeAgentsYaml(vibezzzDir, entries);
+			}
+
+			activeRuns.delete(key);
+			logSubscribers.delete(key);
+			doneResolve();
+		}
+	}, 5_000);
+
+	// Tail the log file for live streaming
+	const absLogPath = join(entry.cwd, entry.log_path);
+	const subs = getOrCreateSubs(key);
+
+	let lastSize = 0;
+	const tailInterval = setInterval(async () => {
+		try {
+			const { stat } = await import('node:fs/promises');
+			const st = await stat(absLogPath);
+			if (st.size > lastSize) {
+				const { createReadStream } = await import('node:fs');
+				const stream = createReadStream(absLogPath, {
+					start: lastSize,
+					encoding: 'utf-8'
+				});
+				let chunk = '';
+				for await (const data of stream) {
+					chunk += data;
+				}
+				if (chunk) {
+					for (const sub of subs) {
+						try {
+							sub(chunk);
+						} catch { /* subscriber disconnected */ }
+					}
+				}
+				lastSize = st.size;
+			}
+		} catch { /* log file not available yet */ }
+	}, 1_000);
+
+	const activeRun: ActiveRun = {
+		entry,
+		projectPath,
+		stop: async () => {
+			clearInterval(pollInterval);
+			clearInterval(tailInterval);
+			if (pid) {
+				try {
+					process.kill(pid, 'SIGTERM');
+				} catch { /* already dead */ }
+			}
+		},
+		done
+	};
+
+	activeRuns.set(key, activeRun);
 }

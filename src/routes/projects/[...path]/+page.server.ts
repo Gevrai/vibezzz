@@ -94,6 +94,14 @@ export const load: PageServerLoad = async ({ params }) => {
 		signals.agent_active = last.status === 'running';
 	}
 
+	// Add log_url to each entry for UI display
+	const runsWithLogUrls = runs.map((run) => ({
+		...run,
+		log_url: run.log_path
+			? `/api/projects/${encodeURIComponent(projectPath)}/runs/${run.id}/logs`
+			: null
+	}));
+
 	// Project-scoped ideas
 	interface ProjectIdea {
 		id: number;
@@ -123,7 +131,7 @@ export const load: PageServerLoad = async ({ params }) => {
 		path: projectPath,
 		meta,
 		signals,
-		runs: runs.reverse(),
+		runs: runsWithLogUrls.reverse(),
 		activeRun: activeRun
 			? {
 					id: activeRun.entry.id,

@@ -154,6 +154,20 @@
 		location.reload();
 	}
 
+	let promotingRunId = $state<number | null>(null);
+
+	async function promoteToPreview(runId: number) {
+		if (promotingRunId) return;
+		promotingRunId = runId;
+		try {
+			await saveDeployConfig();
+			await fetch(`/api/projects/${data.path}/preview/start`, { method: 'POST' });
+			location.reload();
+		} finally {
+			promotingRunId = null;
+		}
+	}
+
 	// Access actions
 	async function saveDeployConfig() {
 		savingDeploy = true;
@@ -410,7 +424,26 @@
 							{#if run.branch}
 								<span>{run.branch}</span>
 							{/if}
+							{#if run.log_url}
+								<a
+									href={run.log_url}
+									target="_blank"
+									rel="noopener noreferrer"
+									class="text-cyan-400 hover:text-cyan-300"
+								>📄 Log</a>
+							{/if}
 						</div>
+						{#if run.result === 'ready_for_test' && !data.activeRun}
+							<div class="mt-2">
+								<button
+									onclick={() => promoteToPreview(run.id)}
+									disabled={promotingRunId === run.id}
+									class="rounded bg-cyan-600/80 px-3 py-1 text-xs font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
+								>
+									{promotingRunId === run.id ? 'Starting…' : '🚀 Promote to Preview'}
+								</button>
+							</div>
+						{/if}
 					</div>
 				{/each}
 			{/if}
