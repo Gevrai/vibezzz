@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readYaml, writeYaml } from './yaml';
 import { getConfig } from './config';
-import { claimIdeaForPromotion, unclaimIdea } from './ideas';
+import { claimIdeaForPromotion, unclaimIdea, updateIdea } from './ideas';
 
 const execFileAsync = promisify(execFile);
 
@@ -575,34 +575,52 @@ export async function moveProject(
 		throw new Error(`A project named "${projectName}" already exists in category "${targetCategory}"`);
 	}
 
-	// Reject move if project is published (would break routing)
+	// Reject move if project has active publish, preview, or agent run —
+	// those managers are keyed by the old project path and would be stranded.
 	const vibezzzDir = await verifyVibezzzDir(realSrc);
 	if (vibezzzDir) {
-		const deploy = await readYaml<{ publish?: { state?: string } } | null>(
-			join(vibezzzDir, 'deploy.yaml'),
-			null
-		);
+		const deploy = await readYaml<{
+			preview?: { status?: string };
+			publish?: { state?: string };
+		} | null>(join(vibezzzDir, 'deploy.yaml'), null);
+
 		if (deploy?.publish?.state && deploy.publish.state !== 'down') {
 			throw new Error('Cannot move a published project — unpublish first');
+		}
+		if (deploy?.preview?.status && deploy.preview.status !== 'stopped' && deploy.preview.status !== 'failed') {
+			throw new Error('Cannot move a project with an active preview — stop it first');
+		}
+
+		const agents = await readYaml<AgentEntry[]>(join(vibezzzDir, 'agents.yaml'), []);
+		const hasActiveRun = agents.some((a) => a.status === 'running');
+		if (hasActiveRun) {
+			throw new Error('Cannot move a project with a running agent — stop it first');
 		}
 	}
 
 	// Move the directory
 	await rename(realSrc, destAbs);
 
-	// Update meta.yaml category field
+	// Update meta.yaml category field and capture idea_id for link fixup
 	const newVibezzzDir = await verifyVibezzzDir(destAbs);
+	let ideaId: number | null = null;
 	if (newVibezzzDir) {
 		const metaPath = join(newVibezzzDir, 'meta.yaml');
 		const meta = await readYaml<ProjectMeta | null>(metaPath, null);
 		if (meta) {
 			meta.category = targetCategory;
+			ideaId = meta.idea_id;
 			await writeYaml(metaPath, meta);
 		}
 	}
 
-	// Return updated project data
+	// Update the linked idea's project_path so inbox links stay valid
 	const newPath = join(targetCategory, projectName);
+	if (ideaId != null) {
+		await updateIdea(ideaId, { project_path: newPath });
+	}
+
+	// Return updated project data
 	const signals = newVibezzzDir ? await readSignals(newVibezzzDir) : { ...DEFAULT_SIGNALS };
 	const meta = newVibezzzDir
 		? await readYaml<ProjectMeta | null>(join(newVibezzzDir, 'meta.yaml'), null)

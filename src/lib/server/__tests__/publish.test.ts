@@ -334,6 +334,51 @@ describe('publish — state transitions', () => {
 		expect(meta.project_stage).toBe('building');
 	});
 
+	it('down transition preserves preview_ready when preview is still active', async () => {
+		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
+		await mkdir(vibezzzDir, { recursive: true });
+		const { writeYaml, readYaml } = await import('../yaml');
+		await writeYaml(join(vibezzzDir, 'deploy.yaml'), {
+			preview: {
+				command: 'bun run dev',
+				port: 3001,
+				healthcheck_path: '/',
+				pid: 12345,
+				process_started_at: new Date().toISOString(),
+				status: 'ready',
+				subdomain: 'proj-preview',
+				url: 'https://proj-preview.test.example.com',
+				public: true,
+				last_ready_at: new Date().toISOString()
+			},
+			publish: {
+				state: 'up',
+				subdomain: 'proj',
+				url: 'https://proj.test.example.com',
+				image: 'proj:latest',
+				container_name: 'vibebox-proj',
+				container_id: 'abc123',
+				container_port: 3001,
+				idle_timeout: 300,
+				last_request_at: null,
+				caddy_route_id: 'vibebox-proj'
+			}
+		});
+		await writeYaml(join(vibezzzDir, 'meta.yaml'), {
+			name: 'proj',
+			category: 'cat',
+			origin: 'brain',
+			created_at: new Date().toISOString(),
+			project_stage: 'published'
+		});
+
+		const { applyPublishState } = await import('../publish');
+		await applyPublishState(vibezzzDir, 'cat/proj', 'proj', 'down');
+
+		const meta = await readYaml<any>(join(vibezzzDir, 'meta.yaml'), null);
+		expect(meta.project_stage).toBe('preview_ready');
+	});
+
 	it('down transition clears publish url and container_id', async () => {
 		const vibezzzDir = join(tempDir, 'cat', 'proj', '.vibezzz');
 		await mkdir(vibezzzDir, { recursive: true });

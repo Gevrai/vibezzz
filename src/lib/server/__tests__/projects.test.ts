@@ -252,4 +252,59 @@ describe('projects', () => {
 		expect(project!.signals.agent_active).toBe(true);
 		expect(project!.signals.last_agent_status).toBe('running');
 	});
+
+	it('moveProject updates linked idea project_path', async () => {
+		const { appendIdea, getIdea } = await import('../ideas.js');
+		const { promoteIdeaToProject, moveProject } = await import('../projects.js');
+
+		await appendIdea('movable idea');
+		await promoteIdeaToProject({ ideaId: 1, name: 'movable', category: 'js' });
+
+		const idea = await getIdea(1);
+		expect(idea?.project_path).toBe('js/movable');
+
+		await moveProject('js/movable', 'web');
+
+		const updated = await getIdea(1);
+		expect(updated?.project_path).toBe('web/movable');
+	});
+
+	it('moveProject rejects when preview is active', async () => {
+		const { appendIdea } = await import('../ideas.js');
+		const { promoteIdeaToProject, moveProject } = await import('../projects.js');
+
+		await appendIdea('preview active');
+		await promoteIdeaToProject({ ideaId: 1, name: 'active-prev', category: 'js' });
+
+		// Write deploy.yaml with active preview
+		await writeYaml(
+			join(projectsDir, 'js', 'active-prev', '.vibezzz', 'deploy.yaml'),
+			{
+				preview: { status: 'ready', command: 'bun dev', port: 3001 },
+				publish: { state: 'down' }
+			}
+		);
+
+		await expect(moveProject('js/active-prev', 'web')).rejects.toThrow(
+			'active preview'
+		);
+	});
+
+	it('moveProject rejects when agent is running', async () => {
+		const { appendIdea } = await import('../ideas.js');
+		const { promoteIdeaToProject, moveProject } = await import('../projects.js');
+
+		await appendIdea('agent active');
+		await promoteIdeaToProject({ ideaId: 1, name: 'active-agent', category: 'js' });
+
+		// Write agents.yaml with running agent
+		await writeYaml(
+			join(projectsDir, 'js', 'active-agent', '.vibezzz', 'agents.yaml'),
+			[{ id: 'run-1', status: 'running', started_at: new Date().toISOString() }]
+		);
+
+		await expect(moveProject('js/active-agent', 'web')).rejects.toThrow(
+			'running agent'
+		);
+	});
 });

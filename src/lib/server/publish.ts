@@ -415,7 +415,10 @@ export async function applyPublishState(
 		const metaPath = join(vibezzzDir, 'meta.yaml');
 		const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
 		if (meta && meta.project_stage === 'published') {
-			meta.project_stage = 'building';
+			// If preview is still active, revert to preview_ready rather than
+			// building so the preview flow remains untouched.
+			meta.project_stage =
+				deploy.preview?.status === 'ready' ? 'preview_ready' : 'building';
 			await writeYaml(metaPath, meta);
 		}
 	}

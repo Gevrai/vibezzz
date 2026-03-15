@@ -2,6 +2,9 @@
  * Synthesis API endpoint.
  * Sends raw ideas to a provider for triage/synthesis.
  * Output is ephemeral — not persisted.
+ *
+ * Runs the agent CLI in an isolated temp directory so it cannot
+ * modify repository files or commit side-effects.
  */
 
 import { json, error } from '@sveltejs/kit';
@@ -9,6 +12,9 @@ import type { RequestHandler } from './$types';
 import { listIdeas } from '$lib/server/ideas';
 import { getProvider, type ProviderName, listProviders } from '$lib/server/providers';
 import { getConfig } from '$lib/server/config';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 export const POST: RequestHandler = async ({ request }) => {
 	const body = await request.json();
@@ -39,12 +45,15 @@ ${ideasText}
 
 Respond concisely with a structured ranking.`;
 
+	// Use an isolated temp directory so the agent CLI cannot modify
+	// repository files, create commits, or cause other side-effects.
+	const sandboxDir = await mkdtemp(join(tmpdir(), 'vibebox-synthesis-'));
+
 	try {
 		const provider = getProvider(providerName);
-		// Use a temporary directory for synthesis (not a real project)
 		const handle = await provider.startRun({
 			prompt,
-			cwd: getConfig().vibezzzRepo,
+			cwd: sandboxDir,
 			kind: 'custom'
 		});
 
@@ -76,5 +85,8 @@ Respond concisely with a structured ranking.`;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Synthesis failed';
 		throw error(500, message);
+	} finally {
+		// Clean up the sandbox — fire-and-forget
+		rm(sandboxDir, { recursive: true, force: true }).catch(() => {});
 	}
 };
