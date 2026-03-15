@@ -477,7 +477,9 @@ export async function updatePublishSettings(
 	if (oldSubdomainToDelete) {
 		const oldEntry = lazyRegistry.get(oldSubdomainToDelete);
 		if (oldEntry) {
-			savedOldLazyEntry = { ...oldEntry, starting: false, startPromise: null };
+			// Keep a reference to the canonical entry object so an in-flight
+			// wake's startPromise/hostPort mutations aren't lost on rollback.
+			savedOldLazyEntry = oldEntry;
 			oldEntry.disabled = true;
 		}
 	}
@@ -835,10 +837,13 @@ export async function reconcilePublish(
 	const pub = deploy.publish;
 	const config = getConfig();
 
-	// Retry cleanup of any retired routes that failed to remove previously
+	// Retry cleanup of any retired routes that failed to remove previously.
+	// Skip the currently active caddy_route_id — a rename may have recycled
+	// an old route ID back into active use.
 	if (pub.retired_routes && pub.retired_routes.length > 0) {
 		const remaining: string[] = [];
 		for (const routeId of pub.retired_routes) {
+			if (routeId === pub.caddy_route_id) continue;
 			const removed = await removeRoute(routeId);
 			if (!removed) {
 				remaining.push(routeId);
@@ -955,6 +960,10 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 	// Check if container is already running
 	const running = await containerIsRunning(entry.containerName);
 	if (running && entry.hostPort) {
+		// Re-check disabled after the async gap — a concurrent transition
+		// (unpublish, rename) may have flipped it while we were awaiting.
+		if (entry.disabled) return null;
+
 		// Ensure Caddy routes directly to the live container (may have been
 		// missed if a previous route update failed or if the request arrived
 		// during a brief race window).  If the route switch fails, return
