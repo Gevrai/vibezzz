@@ -55,9 +55,34 @@ function nowISO(): string {
 	return new Date().toISOString();
 }
 
-/** Determine a high-level result from a process exit code. */
-function resultFromExit(exitCode: number): RunResult {
-	return exitCode === 0 ? 'ready_for_test' : 'failed';
+/**
+ * Determine a high-level result from a process exit code and run kind.
+ *
+ * - bootstrap + exit 0 → building (project scaffolded, not feature-complete)
+ * - implement/refine/custom + exit 0 → ready_for_test
+ * - exit 75 (EX_TEMPFAIL) → blocked (needs human intervention)
+ * - other non-zero → failed
+ */
+function resultFromExit(exitCode: number, kind: RunKind): RunResult {
+	if (exitCode === 0) {
+		return kind === 'bootstrap' ? 'building' : 'ready_for_test';
+	}
+	if (exitCode === 75) {
+		return 'blocked';
+	}
+	return 'failed';
+}
+
+/** Check if git working tree has unmerged paths (merge conflicts). */
+async function gitHasConflicts(cwd: string): Promise<boolean> {
+	try {
+		const { stdout } = await execFileAsync(
+			'git', ['ls-files', '--unmerged', '--error-unmatch'], { cwd }
+		);
+		return stdout.trim().length > 0;
+	} catch {
+		return false;
+	}
 }
 
 /** Read the current git branch in a project directory. */
@@ -105,7 +130,7 @@ function toWebStream(nodeStream: Readable | null): ReadableStream<Uint8Array> {
 }
 
 /** Create an AgentRunHandle from a Node.js ChildProcess. */
-function handleFromProcess(proc: ChildProcess, branch: string, cwd: string): AgentRunHandle {
+function handleFromProcess(proc: ChildProcess, branch: string, cwd: string, kind: RunKind): AgentRunHandle {
 	const startedAt = nowISO();
 	const pid = proc.pid ?? 0;
 
@@ -138,11 +163,19 @@ function handleFromProcess(proc: ChildProcess, branch: string, cwd: string): Age
 		async wait() {
 			const exitCode = await exitPromise;
 			const commitSha = await gitCommitSha(cwd);
+			let result = resultFromExit(exitCode, kind);
+
+			// Promote failed → blocked when git has unresolved merge conflicts
+			if (result === 'failed') {
+				const conflicts = await gitHasConflicts(cwd);
+				if (conflicts) result = 'blocked';
+			}
+
 			return {
 				exitCode,
 				finishedAt: nowISO(),
 				commitSha,
-				result: resultFromExit(exitCode)
+				result
 			};
 		}
 	};
@@ -168,7 +201,7 @@ export class ClaudeProvider implements AIProvider {
 		// Close stdin to signal that the full prompt was the positional arg
 		proc.stdin?.end();
 
-		return handleFromProcess(proc, branch, input.cwd);
+		return handleFromProcess(proc, branch, input.cwd, input.kind);
 	}
 }
 
@@ -189,7 +222,7 @@ export class CopilotProvider implements AIProvider {
 
 		proc.stdin?.end();
 
-		return handleFromProcess(proc, branch, input.cwd);
+		return handleFromProcess(proc, branch, input.cwd, input.kind);
 	}
 }
 

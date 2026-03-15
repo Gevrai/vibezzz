@@ -275,13 +275,30 @@ export async function startRun(opts: StartRunOptions): Promise<AgentRunEntry> {
 				}
 			}
 
-			// Spec: only notify on failure for automation/bootstrap runs
+			// Update project stage based on result
+			if (result.result === 'building' || result.result === 'blocked') {
+				const metaPath = join(opts.vibezzzDir, 'meta.yaml');
+				const meta = await readYaml<Record<string, unknown> | null>(metaPath, null);
+				if (meta) {
+					meta.project_stage = 'building';
+					await writeYaml(metaPath, meta);
+				}
+			}
+
+			// Spec: notify on failure/blocked for automation/bootstrap runs
 			const isAutomated = opts.kind === 'bootstrap';
 			if (result.result === 'failed' && isAutomated) {
 				await notify(
 					'run_failed',
 					opts.projectPath,
 					`Agent run failed for ${opts.projectPath} (exit code ${result.exitCode})`
+				);
+			}
+			if (result.result === 'blocked') {
+				await notify(
+					'run_blocked',
+					opts.projectPath,
+					`Agent run blocked for ${opts.projectPath} — needs human intervention`
 				);
 			}
 		} finally {

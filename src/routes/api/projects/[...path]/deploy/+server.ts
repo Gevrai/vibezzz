@@ -1,5 +1,5 @@
 /**
- * Update deploy configuration (preview command, port, etc).
+ * Update deploy configuration (preview command, port, publish settings, etc).
  */
 
 import { json, error } from '@sveltejs/kit';
@@ -9,6 +9,7 @@ import { realpath } from 'node:fs/promises';
 import { getConfig } from '$lib/server/config';
 import { verifyVibezzzDir } from '$lib/server/projects';
 import { updateDeploySettings, readDeployConfig } from '$lib/server/preview';
+import { updatePublishSettings } from '$lib/server/publish';
 
 export const GET: RequestHandler = async ({ params }) => {
 	const projectPath = params.path;
@@ -63,12 +64,22 @@ export const POST: RequestHandler = async ({ params, request }) => {
 	if (!vibezzzDir) throw error(404, '.vibezzz not found');
 
 	const body = await request.json();
-	const config = await updateDeploySettings(vibezzzDir, {
+	let config = await updateDeploySettings(vibezzzDir, {
 		previewCommand: body.preview_command,
 		previewPort: body.preview_port ? parseInt(body.preview_port, 10) : undefined,
 		previewSubdomain: body.preview_subdomain,
 		healthcheckPath: body.healthcheck_path
 	});
+
+	// Also update publish settings if provided
+	if (body.publish_image !== undefined || body.publish_subdomain !== undefined) {
+		const segments = projectPath.split('/');
+		const projectName = segments[segments.length - 1] || projectPath;
+		config = await updatePublishSettings(vibezzzDir, projectName, {
+			image: body.publish_image,
+			subdomain: body.publish_subdomain
+		});
+	}
 
 	return json(config);
 };

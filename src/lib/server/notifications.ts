@@ -14,7 +14,9 @@ import { getConfig } from './config.js';
 export type NotificationEvent =
 	| 'preview_ready'
 	| 'publish_succeeded'
+	| 'publish_failed'
 	| 'run_failed'
+	| 'run_blocked'
 	| 'run_completed';
 
 export interface NotificationPayload {

@@ -21,11 +21,21 @@
 	let startingPreview = $state(false);
 	let stoppingPreview = $state(false);
 
+	// Publish state
+	let publishImage = $state(data.deploy?.publish?.image ?? '');
+	let publishSubdomain = $state(data.deploy?.publish?.subdomain ?? '');
+	let publishState = $state<'up' | 'down' | 'lazy'>((data.deploy?.publish?.state as 'up' | 'down' | 'lazy') ?? 'down');
+	let publishingAction = $state(false);
+	let savingPublish = $state(false);
+
 	// Re-sync local state when data changes (e.g. after navigation)
 	$effect(() => {
 		previewCommand = data.deploy?.preview?.command ?? '';
 		previewPort = data.deploy?.preview?.port ?? 3001;
 		previewSubdomain = data.deploy?.preview?.subdomain ?? '';
+		publishImage = data.deploy?.publish?.image ?? '';
+		publishSubdomain = data.deploy?.publish?.subdomain ?? '';
+		publishState = (data.deploy?.publish?.state as 'up' | 'down' | 'lazy') ?? 'down';
 	});
 
 	const stageColors: Record<string, string> = {
@@ -48,6 +58,19 @@
 		starting: 'bg-yellow-500/20 text-yellow-400',
 		stopped: 'bg-gray-500/20 text-gray-400',
 		failed: 'bg-red-500/20 text-red-400'
+	};
+
+	const publishStateColors: Record<string, string> = {
+		up: 'bg-green-500/20 text-green-400',
+		lazy: 'bg-amber-500/20 text-amber-400',
+		down: 'bg-gray-500/20 text-gray-400'
+	};
+
+	const resultColors: Record<string, string> = {
+		ready_for_test: 'text-green-400',
+		building: 'text-orange-400',
+		blocked: 'text-yellow-400',
+		failed: 'text-red-400'
 	};
 
 	function elapsed(started: string): string {
@@ -204,6 +227,52 @@
 			location.reload();
 		} finally {
 			stoppingPreview = false;
+		}
+	}
+
+	// Publish actions
+	async function savePublishConfig() {
+		savingPublish = true;
+		try {
+			await fetch(`/api/projects/${data.path}/publish`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					image: publishImage,
+					subdomain: publishSubdomain
+				})
+			});
+		} finally {
+			savingPublish = false;
+		}
+	}
+
+	async function publishAction() {
+		publishingAction = true;
+		try {
+			await savePublishConfig();
+			await fetch(`/api/projects/${data.path}/publish`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ state: publishState })
+			});
+			location.reload();
+		} finally {
+			publishingAction = false;
+		}
+	}
+
+	async function unpublishAction() {
+		publishingAction = true;
+		try {
+			await fetch(`/api/projects/${data.path}/publish`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ state: 'down' })
+			});
+			location.reload();
+		} finally {
+			publishingAction = false;
 		}
 	}
 </script>
@@ -407,7 +476,7 @@
 								</span>
 								<span class="text-xs text-gray-400">{run.provider}</span>
 								{#if run.result}
-									<span class="text-xs text-gray-500">→ {run.result}</span>
+									<span class="text-xs {resultColors[run.result] || 'text-gray-500'}">→ {run.result.replace('_', ' ')}</span>
 								{/if}
 							</div>
 							<span class="text-xs text-gray-500">#{run.id}</span>
@@ -556,23 +625,106 @@
 				</div>
 			</div>
 
-			<!-- Publish section (placeholder for future task) -->
+			<!-- Publish section -->
 			<div class="rounded-lg border border-gray-800 bg-gray-900 p-4">
-				<h3 class="text-sm font-semibold text-gray-300">Publish</h3>
-				<p class="mt-2 text-xs text-gray-500">
-					Container-based publish will be available in the next phase.
-					Use preview URLs for now to share projects.
+				<div class="flex items-center justify-between">
+					<h3 class="text-sm font-semibold text-gray-300">Publish</h3>
+					<span class="rounded-full px-2 py-0.5 text-xs font-medium {publishStateColors[data.deploy?.publish?.state ?? 'down'] || 'bg-gray-500/20 text-gray-400'}">
+						{data.deploy?.publish?.state ?? 'down'}
+					</span>
+				</div>
+
+				<p class="mt-1 text-xs text-gray-500">
+					Publish keeps your project accessible at a stable public URL beyond the temporary preview.
 				</p>
-				{#if data.deploy?.publish}
-					<div class="mt-2 space-y-1 text-xs text-gray-500">
-						<p>Subdomain: {data.deploy.publish.subdomain || '—'}</p>
-						<p>State: {data.deploy.publish.state || 'down'}</p>
-						{#if data.deploy.publish.url}
-							<a href={data.deploy.publish.url} target="_blank" rel="noopener noreferrer" class="text-green-400 hover:text-green-300">
-								🌐 {data.deploy.publish.url}
-							</a>
-						{/if}
+
+				{#if data.deploy?.publish?.url}
+					<a
+						href={data.deploy.publish.url}
+						target="_blank"
+						rel="noopener noreferrer"
+						class="mt-2 inline-block text-sm text-green-400 hover:text-green-300"
+					>
+						🌐 {data.deploy.publish.url}
+					</a>
+				{/if}
+
+				<div class="mt-3 space-y-2">
+					<div>
+						<label for="publish-image" class="text-xs text-gray-500">Container Image</label>
+						<input
+							id="publish-image"
+							type="text"
+							bind:value={publishImage}
+							placeholder="e.g. my-app:latest or ghcr.io/user/app:v1"
+							class="mt-1 w-full rounded border border-gray-700 bg-gray-800 px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:border-green-500 focus:outline-none"
+						/>
 					</div>
+					<div class="flex gap-2">
+						<div class="flex-1">
+							<label for="publish-subdomain" class="text-xs text-gray-500">Subdomain</label>
+							<input
+								id="publish-subdomain"
+								type="text"
+								bind:value={publishSubdomain}
+								placeholder="my-project"
+								class="mt-1 w-full rounded border border-gray-700 bg-gray-800 px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:border-green-500 focus:outline-none"
+							/>
+						</div>
+						<div class="flex-1">
+							<label for="publish-state" class="text-xs text-gray-500">State</label>
+							<select
+								id="publish-state"
+								bind:value={publishState}
+								class="mt-1 w-full rounded border border-gray-700 bg-gray-800 px-3 py-1.5 text-sm text-white focus:border-green-500 focus:outline-none"
+							>
+								<option value="up">up — always running</option>
+								<option value="lazy">lazy — starts on first request</option>
+								<option value="down">down — stopped</option>
+							</select>
+						</div>
+					</div>
+				</div>
+
+				<div class="mt-3 flex flex-wrap gap-2">
+					<button
+						onclick={savePublishConfig}
+						disabled={savingPublish}
+						class="rounded bg-gray-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-gray-600 disabled:opacity-50"
+					>
+						{savingPublish ? 'Saving…' : '💾 Save Config'}
+					</button>
+
+					{#if data.deploy?.publish?.state === 'up' || data.deploy?.publish?.state === 'lazy'}
+						<button
+							onclick={unpublishAction}
+							disabled={publishingAction}
+							class="rounded bg-red-600/80 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500 disabled:opacity-50"
+						>
+							{publishingAction ? 'Unpublishing…' : '⬛ Unpublish'}
+						</button>
+						<button
+							onclick={publishAction}
+							disabled={publishingAction || !publishImage.trim()}
+							class="rounded bg-yellow-600/80 px-3 py-1.5 text-xs font-medium text-white hover:bg-yellow-500 disabled:opacity-50"
+						>
+							{publishingAction ? 'Updating…' : '🔄 Update Publish'}
+						</button>
+					{:else}
+						<button
+							onclick={publishAction}
+							disabled={publishingAction || !publishImage.trim() || !publishSubdomain.trim() || publishState === 'down'}
+							class="rounded bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-500 disabled:opacity-50"
+						>
+							{publishingAction ? 'Publishing…' : '🚀 Publish'}
+						</button>
+					{/if}
+				</div>
+
+				{#if data.deploy?.publish?.container_id}
+					<p class="mt-2 text-xs text-gray-500">
+						Container: <span class="font-mono">{data.deploy.publish.container_id.slice(0, 12)}</span>
+					</p>
 				{/if}
 			</div>
 
