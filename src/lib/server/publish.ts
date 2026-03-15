@@ -348,12 +348,30 @@ export async function updatePublishSettings(
 
 	// -- Live side-effects (only reached after successful persist) --
 
+	// Disable old lazy entry before removal so in-flight wakeAndProxy()
+	// calls on the old subdomain abort instead of persisting stale metadata.
+	if (oldSubdomainToDelete) {
+		const oldEntry = lazyRegistry.get(oldSubdomainToDelete);
+		if (oldEntry) oldEntry.disabled = true;
+	}
+
 	if (oldRouteToRemove) await removeRoute(oldRouteToRemove);
 	if (oldSubdomainToDelete) lazyRegistry.delete(oldSubdomainToDelete);
 	if (lazyReRegistration) {
 		const config = getConfig();
 		const host = `${settings.subdomain}.${config.domain}`;
-		await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+		const routeOk = await upsertRoute(deploy.publish.caddy_route_id, host, config.port);
+		if (!routeOk) {
+			// Route registration failed — restore previous persisted state
+			// so in-memory and on-disk stay consistent.
+			console.error(`[publish] Caddy route upsert failed for ${host}, rolling back subdomain change`);
+			deploy.publish.subdomain = oldSubdomainToDelete!;
+			deploy.publish.container_name = `vibebox-${oldSubdomainToDelete}`;
+			deploy.publish.caddy_route_id = `vibebox-${oldSubdomainToDelete}`;
+			deploy.publish.url = deploy.publish.state === 'lazy' ? `https://${oldSubdomainToDelete}.${config.domain}` : deploy.publish.url;
+			await writeDeployConfig(vibezzzDir, deploy);
+			throw new Error(`Failed to register Caddy route for new subdomain ${settings.subdomain}`);
+		}
 		lazyReRegistration();
 	}
 
@@ -737,19 +755,24 @@ export async function wakeAndProxy(hostname: string): Promise<number | null> {
 			}
 
 			// Persist container_id and host_port atomically via the deploy lock.
-			// Revalidates that persisted state is still 'lazy' to prevent
-			// reviving runtime metadata after a concurrent unpublish.
+			// Revalidates state AND identity (subdomain/container) to prevent
+			// persisting stale metadata after a concurrent subdomain rename or unpublish.
 			try {
 				await withDeployLock(entry.vibezzzDir, async () => {
 					const deploy = await readDeployConfig(entry.vibezzzDir);
-					if (deploy?.publish && deploy.publish.state === 'lazy') {
+					if (
+						deploy?.publish &&
+						deploy.publish.state === 'lazy' &&
+						deploy.publish.subdomain === subdomain &&
+						deploy.publish.container_name === entry.containerName
+					) {
 						deploy.publish.container_id = containerId;
 						deploy.publish.host_port = hostPort;
 						deploy.publish.last_request_at = new Date().toISOString();
 						await writeDeployConfig(entry.vibezzzDir, deploy);
 					} else {
-						// State changed during wake (e.g. unpublished) — abort
-						throw new Error('Publish state changed during lazy wake');
+						// State or identity changed during wake (e.g. unpublished or subdomain renamed) — abort
+						throw new Error('Publish state or identity changed during lazy wake');
 					}
 				});
 			} catch (persistErr) {
